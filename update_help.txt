@@ -1,0 +1,4 @@
+cd PATH
+git add .
+git commit -m "Updated script parameters"
+git push

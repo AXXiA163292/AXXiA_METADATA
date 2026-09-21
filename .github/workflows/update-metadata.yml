@@ -2,7 +2,8 @@ name: Update Metadata
 
 on:
   schedule:
-    - cron: '*/20 * * * *'
+    # Runs twice a day at 04:00 UTC and 16:00 UTC (06:00 and 18:00 GMT+2)
+    - cron: '0 4,16 * * *'
   workflow_dispatch:
 
 jobs:
