@@ -2,8 +2,8 @@ name: Update Metadata
 
 on:
   schedule:
-    # Runs twice a day at 04:00 UTC and 16:00 UTC (06:00 and 18:00 GMT+2)
-    - cron: '0 4,16 * * *'
+    # Runs every 30 minutes
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -19,7 +19,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-	  cache: 'pip'
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
