@@ -30,7 +30,7 @@ from playwright.sync_api import sync_playwright
 import requests
 
 SPREADSHEET_ID = '1Fpp_sJbGjuKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak'
-SHEET_NAME = 'hololive_best'
+SHEET_NAME = 'hololive'
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SERVICE_ACCOUNT = os.path.join(SCRIPT_DIR, 'service_account.json')
