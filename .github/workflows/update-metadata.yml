@@ -2,8 +2,7 @@ name: Update Metadata
 
 on:
   schedule:
-    # Runs every hour on the hour (e.g., 01:00, 02:00, 03:00)
-    - cron: '0 * * * *'
+    - cron: '0 */3 * * *'
   workflow_dispatch:
 
 jobs:
@@ -26,22 +25,32 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Custom Script
+      - name: Run Judgment Script
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-        run: python custom.py
+        run: python judgment.py
 
       - name: Run Database Script
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         run: python database.py
 
-      - name: Run Fandom Script
+      - name: Fandom Script
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         run: python fandom.py
 
-      - name: Run Judgment Script
+      - name: Run Custom Script
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-        run: python judgment.py
+        run: python custom.py
+
+      - name: Run Hololive Database Script
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: python hololive_db.py
+
+      - name: Run Hololive Best Script
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: python hololive_best.py

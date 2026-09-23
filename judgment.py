@@ -7,7 +7,6 @@ import subprocess
 import sys
 import time
 
-# 1. Auto-install missing packages
 REQUIRED = {
     'requests': 'requests',
     'bs4': 'beautifulsoup4',
@@ -19,12 +18,8 @@ for module_name, pip_name in REQUIRED.items():
   try:
     __import__(module_name)
   except ImportError:
-    print(
-        f'Installing missing library: {pip_name}... (this may take a moment)'
-    )
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', pip_name])
 
-# 2. Now safely import everything your script needs
 from bs4 import BeautifulSoup, Tag
 import gspread
 from google.oauth2.service_account import Credentials
@@ -32,11 +27,10 @@ import requests
 
 SPREADSHEET_ID = '1Fpp_sJbGjuKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak'
 SHEET_NAME = 'judgment'
+CONSTANTS_SID = '1B8tX9VL2PcSJKyuHFVd2UT_8kYlY4ZdwHwg9MfWOPug'
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SERVICE_ACCOUNT = os.path.join(SCRIPT_DIR, 'service_account.json')
-CONSTANTS_SID = '1B8tX9VL2PcSJKyuHFVd2UT_8kYlY4ZdwHwg9MfWOPug'
-
 IS_GITHUB_ACTIONS = os.environ.get('GITHUB_ACTIONS') == 'true'
 
 DIFFICULTIES = ['APPEND', 'MASTER', 'EXPERT', 'HARD']
@@ -52,7 +46,6 @@ S.headers.update({'User-Agent': 'Mozilla/5.0'})
 
 
 def load_constants():
-  """Returns dict: (diff_label, song_id_int) -> constant_str"""
   url = f'https://docs.google.com/spreadsheets/d/{CONSTANTS_SID}/gviz/tq?tqx=out:csv&sheet=Constants&range=C:G'
   resp = S.get(url, timeout=30)
   resp.raise_for_status()
@@ -65,13 +58,11 @@ def load_constants():
     constant = row[0].strip().replace(',', '.')
     diff = row[3].strip()
     sid = row[4].strip()
-    if not constant or not diff or not sid:
-      continue
-    try:
-      lookup[(diff, int(sid))] = constant
-    except ValueError:
-      pass
-  print(f'  Constants loaded: {len(lookup)} entries')
+    if constant and diff and sid:
+      try:
+        lookup[(diff, int(sid))] = constant
+      except ValueError:
+        pass
   return lookup
 
 
@@ -122,11 +113,9 @@ def parse_difficulty(difficulty):
     tbody_m = re.search(r'<tbody>([\s\S]*?)</tbody>', section, re.I)
     if not tbody_m:
       continue
-    tbody = tbody_m.group(1)
 
-    for row_m in re.finditer(r'<tr>([\s\S]*?)</tr>', tbody, re.I):
-      row_html = row_m.group(1)
-      cells = re.findall(r'<td[^>]*>([\s\S]*?)</td>', row_html, re.I)
+    for row_m in re.finditer(r'<tr>([\s\S]*?)</tr>', tbody_m.group(1), re.I):
+      cells = re.findall(r'<td[^>]*>([\s\S]*?)</td>', row_m.group(1), re.I)
       if len(cells) < 2:
         continue
 
@@ -180,58 +169,46 @@ def load_jp_musics_ids(gc, spreadsheet_id):
   data = ws.get('A:E')
   mapping = {}
   for row in data[1:]:
-    if len(row) < 5:
-      continue
-    sid = row[0].strip()
-    title = row[4].strip()
-    if title and sid:
-      mapping[title] = sid
-  print(f'  jp_musics loaded: {len(mapping)} entries')
+    if len(row) >= 5 and row[0].strip() and row[4].strip():
+      mapping[row[4].strip()] = row[0].strip()
   return mapping
 
 
 def JUDGMENT():
   print('=== JUDGMENT() started ===')
-
   all_rows = []
-  for diff in DIFFICULTIES:
-    print(f'  Fetching {diff}...')
+  total_diffs = len(DIFFICULTIES)
+
+  for idx, diff in enumerate(DIFFICULTIES):
     rows = parse_difficulty(diff)
-    print(f'    -> {len(rows)} rows')
+    print(f'  [{idx+1}/{total_diffs}] Difficulty • {diff} ({len(rows)} rows)')
     all_rows.extend(rows)
-    time.sleep(0.5)
+    time.sleep(0.4)
 
   if not all_rows:
     print('[error] No data scraped.')
     sys.exit(1)
 
-  print(f'Total rows: {len(all_rows)}')
-
-  print('Connecting to Google Sheets...')
   scopes = [
       'https://www.googleapis.com/auth/spreadsheets',
       'https://www.googleapis.com/auth/drive',
   ]
-
-  # Load credentials from GitHub Secret or local file
   if os.environ.get('GCP_SA_KEY'):
-    key_dict = json.loads(os.environ['GCP_SA_KEY'])
-    creds = Credentials.from_service_account_info(key_dict, scopes=scopes)
+    creds = Credentials.from_service_account_info(
+        json.loads(os.environ['GCP_SA_KEY']), scopes=scopes
+    )
   else:
     creds = Credentials.from_service_account_file(
         SERVICE_ACCOUNT, scopes=scopes
     )
 
   gc = gspread.authorize(creds)
-
-  print('Loading lookup tables...')
   constants = load_constants()
   id_map = load_jp_musics_ids(gc, SPREADSHEET_ID)
 
   final_rows = []
   for row in all_rows:
-    title = row[0]
-    difficulty = row[4]
+    title, difficulty = row[0], row[4]
     song_id = id_map.get(title)
     constant = (
         get_constant(constants, song_id, difficulty) if title != '-' else '-'
@@ -259,19 +236,16 @@ def JUDGMENT():
       range_name='A1', values=header + final_rows, value_input_option='RAW'
   )
 
-  print(f"=== Done. {len(final_rows)} rows written to '{SHEET_NAME}' tab. ===")
+  print(f'=== Done. {len(final_rows)} rows written. ===')
 
 
 if __name__ == '__main__':
-  import traceback
-
   try:
     JUDGMENT()
   except Exception as e:
-    print('\n' + '=' * 40)
-    print('CRASH LOG:')
+    import traceback
+
     traceback.print_exc()
-    print('=' * 40 + '\n')
   finally:
     if not IS_GITHUB_ACTIONS:
       input('Press Enter to exit...')

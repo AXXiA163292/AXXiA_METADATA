@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import re
@@ -5,7 +6,6 @@ import subprocess
 import sys
 import time
 
-# 1. Auto-install missing packages
 REQUIRED = {
     'requests': 'requests',
     'bs4': 'beautifulsoup4',
@@ -17,13 +17,8 @@ for module_name, pip_name in REQUIRED.items():
   try:
     __import__(module_name)
   except ImportError:
-    print(
-        f'Installing missing library: {pip_name}... (this may take a moment)'
-    )
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', pip_name])
 
-# 2. Now safely import everything your script needs
-from bs4 import BeautifulSoup, Tag
 import gspread
 from google.oauth2.service_account import Credentials
 import requests
@@ -34,13 +29,10 @@ SHEET_NAME = 'custom'
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SERVICE_ACCOUNT = os.path.join(SCRIPT_DIR, 'service_account.json')
 DELAY = 0.3
-CUSTOM_CACHE_FILE = 'custom_cache.json'
-
 IS_GITHUB_ACTIONS = os.environ.get('GITHUB_ACTIONS') == 'true'
 
 S = requests.Session()
 S.headers.update({'User-Agent': 'Mozilla/5.0'})
-
 EMPTY = ['-'] * 18
 
 
@@ -99,8 +91,7 @@ def fetch_level(raw_url):
   try:
     r = S.get(api_url, timeout=15)
     data = r.json()
-  except Exception as e:
-    print(f'    [error] {e}')
+  except Exception:
     return EMPTY[:]
 
   if not (
@@ -113,7 +104,6 @@ def fetch_level(raw_url):
   it = data['item']
   url = api_url
 
-  # source + apiBase
   if 'untitledcharts.com' in url:
     source, apiBase = 'Untitled Charts', 'https://untitledcharts.com'
   elif 'coconut.sonolus.com/next-sekai' in url:
@@ -135,7 +125,6 @@ def fetch_level(raw_url):
     u = srl['url']
     return u if u.startswith('http') else apiBase + u
 
-  # level id (strip prefix)
   level_id = it.get('name', '-')
   for prefix in ['UnCh-', 'coconut-next-sekai-', 'chcy-', 'ptlv-']:
     if level_id.startswith(prefix):
@@ -147,8 +136,6 @@ def fetch_level(raw_url):
   AGO_RE = re.compile(r'^\d+(s|min|h|d|w|mo|y)\s*ago$', re.I)
 
   tags = it.get('tags') or []
-
-  # difficulty
   difficulty = '-'
   for t in tags:
     if t.get('title', '').lstrip('#').upper() in KNOWN_DIFFS:
@@ -160,13 +147,10 @@ def fetch_level(raw_url):
         difficulty = d
         break
 
-  # tag list
   tag_list = []
   for t in tags:
     lbl = t.get('title', '').lstrip('#')
-    if lbl.upper() in KNOWN_DIFFS:
-      continue
-    if t.get('icon') in META_ICONS:
+    if lbl.upper() in KNOWN_DIFFS or t.get('icon') in META_ICONS:
       continue
     if t.get('icon') == 'tag' or (not t.get('icon') and not AGO_RE.match(lbl)):
       tag_list.append(lbl)
@@ -193,7 +177,6 @@ def fetch_level(raw_url):
       m = re.match(r'^(\d+)(mo|w|d|h)\s*ago$', t['title'].strip(), re.I)
       if not m:
         continue
-      import datetime
 
       num, unit = int(m.group(1)), m.group(2).lower()
       now = datetime.date.today()
@@ -211,7 +194,6 @@ def fetch_level(raw_url):
       for t in tags
   )
 
-  # level URLs
   name = it.get('name', '')
   if source == 'Untitled Charts':
     level_url = f'https://untitledcharts.com/levels/{name}/'
@@ -226,7 +208,6 @@ def fetch_level(raw_url):
   else:
     level_url = '-'
 
-  # UnCh: scrape page for upload date, likes, comments, leaderboard
   if source == 'Untitled Charts' and level_url != '-':
     try:
       page_r = S.get(level_url, timeout=15)
@@ -248,7 +229,7 @@ def fetch_level(raw_url):
       )
       if cm2:
         comments_count = cm2.group(1)
-    except:
+    except Exception:
       pass
 
   return [
@@ -275,30 +256,23 @@ def fetch_level(raw_url):
 
 def CUSTOM():
   print('=== CUSTOM() started ===')
-
-  cache = {}
-  if IS_GITHUB_ACTIONS:
-    print('  Running on GitHub Actions: Cache ignored.')
-  elif os.path.exists(CUSTOM_CACHE_FILE):
-    with open(CUSTOM_CACHE_FILE, 'r', encoding='utf-8') as f:
-      cache = json.load(f)
-    print(f'  Cache loaded: {len(cache)} entries')
-
   scopes = [
       'https://www.googleapis.com/auth/spreadsheets',
       'https://www.googleapis.com/auth/drive',
   ]
 
-  # Load credentials from GitHub Secret or local file
   if os.environ.get('GCP_SA_KEY'):
-    key_dict = json.loads(os.environ['GCP_SA_KEY'])
-    creds = Credentials.from_service_account_info(key_dict, scopes=scopes)
+    creds = Credentials.from_service_account_info(
+        json.loads(os.environ['GCP_SA_KEY']), scopes=scopes
+    )
   else:
     creds = Credentials.from_service_account_file(
         SERVICE_ACCOUNT, scopes=scopes
     )
 
-  ws = gspread.authorize(creds).open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+  ws = (
+      gspread.authorize(creds).open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+  )
 
   col_a = ws.col_values(1)
   col_c = ws.col_values(3)
@@ -309,81 +283,56 @@ def CUSTOM():
     print('No data in column C.')
     return
 
-  # strip trailing "/" from all C cells and write back first
   cleaned_urls = [(raw or '').strip().rstrip('/') for raw in urls]
-  c_write = [[v] for v in cleaned_urls]
-  ws.update(range_name=f'C2:C{1+len(cleaned_urls)}', values=c_write)
-  print(
-      f'  Cleaned {sum(1 for o,n in zip(urls,cleaned_urls) if o!=n)} trailing'
-      ' slashes in column C'
+  ws.update(
+      range_name=f'C2:C{1+len(cleaned_urls)}',
+      values=[[v] for v in cleaned_urls],
   )
 
   updates = []
-  new_entries = 0
+  total_urls = len(cleaned_urls)
 
   for i, raw in enumerate(cleaned_urls):
     row = i + 2
-    raw = raw.strip()
     song_id = ids[i].strip() if i < len(ids) else '-'
     if not raw:
       continue
+
     if not is_url(raw):
-      print(f'  [{song_id}] {raw} — not a URL, writing all -')
+      if song_id and song_id != '-':
+        print(f'  [{i+1}/{total_urls}] {song_id} • {raw} — not a URL')
+      else:
+        print(f'  [{i+1}/{total_urls}] {raw} — not a URL')
       updates.append((row, EMPTY[:]))
       continue
-    # extract server_id from URL before fetching (strip known prefixes)
-    resolved = resolve_url(raw)
-    m_sid = re.search(
-        r'/levels/(?:UnCh-|coconut-next-sekai-|sekai-best-|sekai-rush-|chcy-|ptlv-)?([^/?\s]+)',
-        resolved,
-    )
-    server_id = m_sid.group(1) if m_sid else '-'
-    cache_key = f'{song_id}|{server_id}'
-    if not IS_GITHUB_ACTIONS and cache_key in cache:
-      updates.append((row, cache[cache_key]))
-      continue
+
     time.sleep(DELAY)
     values = fetch_level(raw)
-    actual_server_id = values[0]
-    if actual_server_id != '-':
-      final_key = f'{song_id}|{actual_server_id}'
-      cache[final_key] = values
-      new_entries += 1
     song_name = values[1] if values[1] != '-' else raw
-    print(f'  [{song_id}] {song_name}')
+    if song_id and song_id != '-':
+      print(f'  [{i+1}/{total_urls}] {song_id} • {song_name}')
+    else:
+      print(f'  [{i+1}/{total_urls}] {song_name}')
     updates.append((row, values))
 
-  # batch all writes into one request to avoid 429 rate limit
   if updates:
-    data_batch = []
-    for row, values in updates:
-      data_batch.append(
-          {'range': f'{SHEET_NAME}!D{row}:U{row}', 'values': [values]}
-      )
+    data_batch = [
+        {'range': f'{SHEET_NAME}!D{r}:U{r}', 'values': [v]} for r, v in updates
+    ]
     ws.spreadsheet.values_batch_update(
         {'valueInputOption': 'RAW', 'data': data_batch}
     )
-
-  if not IS_GITHUB_ACTIONS:
-    with open(CUSTOM_CACHE_FILE, 'w', encoding='utf-8') as f:
-      json.dump(cache, f, ensure_ascii=False, indent=2)
-    print(f'  Cache saved ({new_entries} new entries)')
-  else:
-    print('  Running on GitHub Actions: Cache save skipped.')
 
   print(f'=== Done. {len(updates)} rows written. ===')
 
 
 if __name__ == '__main__':
-  import traceback
-
   try:
     CUSTOM()
   except Exception as e:
-    print('\n' + '=' * 40)
-    print('CRASH LOG:')
+    import traceback
+
     traceback.print_exc()
-    print('=' * 40 + '\n')
   finally:
     if not IS_GITHUB_ACTIONS:
       input('Press Enter to exit...')

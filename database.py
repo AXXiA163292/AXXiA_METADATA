@@ -1,14 +1,11 @@
 import json
 import os
-import re
 import subprocess
 import sys
 import time
 
-# 1. Auto-install missing packages
 REQUIRED = {
     'requests': 'requests',
-    'bs4': 'beautifulsoup4',
     'gspread': 'gspread',
     'google.oauth2': 'google-auth',
 }
@@ -17,21 +14,15 @@ for module_name, pip_name in REQUIRED.items():
   try:
     __import__(module_name)
   except ImportError:
-    print(
-        f'Installing missing library: {pip_name}... (this may take a moment)'
-    )
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', pip_name])
 
-# 2. Now safely import everything your script needs
 import gspread
 from google.oauth2.service_account import Credentials
 import requests
 
 SPREADSHEET_ID = '1Fpp_sJbGjuKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak'
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SERVICE_ACCOUNT = os.path.join(SCRIPT_DIR, 'service_account.json')
-
 IS_GITHUB_ACTIONS = os.environ.get('GITHUB_ACTIONS') == 'true'
 
 REGIONS = {
@@ -75,14 +66,8 @@ SCHEMAS = {
         'specialSeasonId',
         'archiveDisplayType',
     ],
-    'musicTags': [
-        'musicId',
-        'musicTag',
-    ],
-    'outsideCharacters': [
-        'id',
-        'name',
-    ],
+    'musicTags': ['musicId', 'musicTag'],
+    'outsideCharacters': ['id', 'name'],
     'musics': [
         'id',
         'seq',
@@ -113,12 +98,10 @@ S.headers.update({'User-Agent': 'Mozilla/5.0'})
 
 
 def fetch_json(region, filename):
-  repo = REGIONS[region]
-  url = BASE_URL.format(repo=repo, file=filename)
+  url = BASE_URL.format(repo=REGIONS[region], file=filename)
   try:
     r = S.get(url, timeout=30)
     if r.status_code == 404:
-      print(f'    [skip] 404 {url}')
       return None
     r.raise_for_status()
     return r.json()
@@ -132,22 +115,15 @@ def flatten_value(val):
     return ''
   if isinstance(val, bool):
     return str(val).upper()
-  if isinstance(val, (int, float)):
-    return val
-  if isinstance(val, str):
+  if isinstance(val, (int, float, str)):
     return val
   if isinstance(val, list):
-    parts = []
-    for item in val:
-      if isinstance(item, dict):
-        parts.append(
-            '{'
-            + ', '.join(f'{k}:{flatten_value(v)}' for k, v in item.items())
-            + '}'
-        )
-      else:
-        parts.append(str(flatten_value(item)))
-    return ', '.join(parts)
+    return ', '.join(
+        '{' + ', '.join(f'{k}:{flatten_value(v)}' for k, v in item.items()) + '}'
+        if isinstance(item, dict)
+        else str(flatten_value(item))
+        for item in val
+    )
   if isinstance(val, dict):
     return (
         '{' + ', '.join(f'{k}:{flatten_value(v)}' for k, v in val.items()) + '}'
@@ -159,13 +135,9 @@ def json_to_rows(data, sheet_suffix):
   if not data or not isinstance(data, list):
     return [['No data']]
 
-  fixed_headers = SCHEMAS.get(sheet_suffix)
-
-  if fixed_headers:
-    headers = fixed_headers
-  else:
-    headers = []
-    seen = set()
+  headers = SCHEMAS.get(sheet_suffix)
+  if not headers:
+    headers, seen = [], set()
     for item in data:
       if isinstance(item, dict):
         for k in item.keys():
@@ -198,11 +170,9 @@ def write_sheet(ss, sheet_name, rows):
 
   CHUNK = 5000
   for i in range(0, len(rows), CHUNK):
-    chunk = rows[i : i + CHUNK]
-    start_row = i + 1
     ws.update(
-        range_name=f'A{start_row}',
-        values=chunk,
+        range_name=f'A{i + 1}',
+        values=rows[i : i + CHUNK],
         value_input_option='RAW',
     )
   return len(rows) - 1
@@ -210,16 +180,15 @@ def write_sheet(ss, sheet_name, rows):
 
 def DATABASE():
   print('=== DATABASE() started ===')
-
   scopes = [
       'https://www.googleapis.com/auth/spreadsheets',
       'https://www.googleapis.com/auth/drive',
   ]
 
-  # Load credentials from GitHub Secret or local file
   if os.environ.get('GCP_SA_KEY'):
-    key_dict = json.loads(os.environ['GCP_SA_KEY'])
-    creds = Credentials.from_service_account_info(key_dict, scopes=scopes)
+    creds = Credentials.from_service_account_info(
+        json.loads(os.environ['GCP_SA_KEY']), scopes=scopes
+    )
   else:
     creds = Credentials.from_service_account_file(
         SERVICE_ACCOUNT, scopes=scopes
@@ -228,39 +197,39 @@ def DATABASE():
   gc = gspread.authorize(creds)
   ss = gc.open_by_key(SPREADSHEET_ID)
 
-  total_sheets = 0
-  total_rows = 0
+  total_tasks = len(FILES) * len(REGIONS)
+  task_count = 0
+  total_sheets, total_rows = 0, 0
 
   for sheet_suffix, filename in FILES:
     for region in REGIONS:
+      task_count += 1
       sheet_name = f'{region}_{sheet_suffix}'
-      print(f'  [{sheet_name}] fetching...')
 
       data = fetch_json(region, filename)
       if data is None:
-        print(f'  [{sheet_name}] skipped (no data)')
+        print(f'  [{task_count}/{total_tasks}] {sheet_name} • skipped (404)')
         continue
 
       rows = json_to_rows(data, sheet_suffix)
       n = write_sheet(ss, sheet_name, rows)
-      print(f'  [{sheet_name}] wrote {n} rows ({len(rows[0])} cols)')
+      print(f'  [{task_count}/{total_tasks}] {sheet_name} • wrote {n} rows')
       total_sheets += 1
       total_rows += n
-      time.sleep(0.3)
+      time.sleep(0.2)
 
-  print(f'=== Done. {total_sheets} sheets written, {total_rows} total rows. ===')
+  print(
+      f'=== Done. {total_sheets} sheets written, {total_rows} total rows. ==='
+  )
 
 
 if __name__ == '__main__':
-  import traceback
-
   try:
     DATABASE()
   except Exception as e:
-    print('\n' + '=' * 40)
-    print('CRASH LOG:')
+    import traceback
+
     traceback.print_exc()
-    print('=' * 40 + '\n')
   finally:
     if not IS_GITHUB_ACTIONS:
       input('Press Enter to exit...')
