@@ -4,7 +4,6 @@ beautifulsoup4
 bs4
 gspread
 google-auth
-google.oauth2
 google-auth-httplib2
 cloudscraper
 curl_cffi
