@@ -1,3 +1,4 @@
+
 import json
 import os
 import re
@@ -26,11 +27,14 @@ except ImportError:
 
 PAGE_URL = "https://pjsekai.com/?03c3cbe6ba#e9ac9fe1"
 BASE_URL = "https://pjsekai.com/"
-SPREADSHEET_ID = "1Fpp_sJbGjuKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak"
+SPREADSHEET_ID = "1Fpp_sJbJguKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak"
 SHEET_NAME = "patterns"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SERVICE_ACCOUNT = os.path.join(SCRIPT_DIR, "service_account.json")
+
 BATCH_SIZE = 40
+TRANSLATION_BATCH_CHARS = 4000
+TRANSLATION_MARKER = "ZXQAXXIAREF{:06d}QXZ"
 
 DIFFICULTIES = {
     "HARD": "hard",
@@ -66,34 +70,137 @@ def to_romaji(text):
         return ROMAJI_CACHE[text]
 
     try:
-        converted = "".join(item["hepburn"] for item in KAKASI.convert(text))
+        converted = "".join(
+            item["hepburn"] for item in KAKASI.convert(text)
+        )
         ROMAJI_CACHE[text] = converted
         return converted
+
     except Exception as error:
         print(f"    Romaji conversion failed: {error}")
         ROMAJI_CACHE[text] = ""
         return ""
 
 
-def translate_text(text):
-    if not text:
-        return ""
+def build_translation_batches(texts):
+    batches = []
+    current = []
+    current_length = 0
 
-    if text in TRANSLATIONS:
-        return TRANSLATIONS[text]
+    for index, text in enumerate(texts):
+        marker = TRANSLATION_MARKER.format(index)
+        segment = f"{marker}\n{text}"
+        segment_length = len(segment) + 2
 
-    for attempt in range(3):
-        try:
-            translated = TRANSLATOR.translate(text) or ""
-            TRANSLATIONS[text] = translated
-            time.sleep(0.15)
-            return translated
-        except Exception as error:
-            print(f"    Translation attempt {attempt + 1} failed: {error}")
-            time.sleep(1.5 * (attempt + 1))
+        if current and current_length + segment_length > TRANSLATION_BATCH_CHARS:
+            batches.append(current)
+            current = []
+            current_length = 0
 
-    TRANSLATIONS[text] = ""
-    return ""
+        current.append((index, marker, text))
+        current_length += segment_length
+
+    if current:
+        batches.append(current)
+
+    return batches
+
+
+def translate_texts(texts):
+    unique_texts = list(dict.fromkeys(text for text in texts if text))
+    missing = [
+        text for text in unique_texts
+        if text not in TRANSLATIONS
+    ]
+
+    if not missing:
+        return TRANSLATIONS
+
+    batches = build_translation_batches(missing)
+    marker_pattern = re.compile(r"ZXQAXXIAREF(\d{6})QXZ")
+
+    print(
+        f"Translating {len(missing)} unique descriptions "
+        f"in {len(batches)} requests."
+    )
+
+    for batch_number, batch in enumerate(batches, 1):
+        combined = "\n\n".join(
+            f"{marker}\n{text}"
+            for _, marker, text in batch
+        )
+
+        translated = None
+
+        for attempt in range(3):
+            try:
+                translated = TRANSLATOR.translate(combined) or ""
+                break
+
+            except Exception as error:
+                print(
+                    f"    Translation batch {batch_number}, "
+                    f"attempt {attempt + 1} failed: {error}"
+                )
+
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+
+        batch_results = {}
+
+        if translated:
+            parts = marker_pattern.split(translated)
+
+            for position in range(1, len(parts) - 1, 2):
+                try:
+                    batch_results[int(parts[position])] = (
+                        parts[position + 1].strip()
+                    )
+                except (ValueError, IndexError):
+                    continue
+
+        expected_indexes = {
+            index for index, _, _ in batch
+        }
+
+        if expected_indexes.issubset(batch_results):
+            for index, _, original in batch:
+                TRANSLATIONS[original] = batch_results[index]
+
+            print(
+                f"    Translated batch "
+                f"{batch_number}/{len(batches)}."
+            )
+
+            time.sleep(0.3)
+            continue
+
+        print(
+            f"    Batch {batch_number} markers were altered "
+            f"or translation failed. Using individual fallback."
+        )
+
+        for _, _, original in batch:
+            result = ""
+
+            for attempt in range(3):
+                try:
+                    result = TRANSLATOR.translate(original) or ""
+                    break
+
+                except Exception as error:
+                    print(
+                        f"    Individual translation attempt "
+                        f"{attempt + 1} failed: {error}"
+                    )
+
+                    if attempt < 2:
+                        time.sleep(2 * (attempt + 1))
+
+            TRANSLATIONS[original] = result
+            time.sleep(0.3)
+
+    return TRANSLATIONS
 
 
 def get_image_url(img):
@@ -159,14 +266,11 @@ def extract_difficulty_table(container):
 
             seen.add(url)
 
-            romaji = to_romaji(description)
-            translation = translate_text(description)
-
             results[current_difficulty].extend([
                 url,
                 description,
-                romaji,
-                translation,
+                "",
+                "",
             ])
 
     return results
@@ -184,6 +288,57 @@ def extract_notes(container):
     return " ".join(notes)
 
 
+def enrich_rows(rows):
+    descriptions = []
+
+    for row in rows:
+        for column in range(1, 5):
+            references = json.loads(row[column])
+
+            descriptions.extend(
+                references[index + 1]
+                for index in range(0, len(references), 4)
+                if references[index + 1]
+            )
+
+    unique_descriptions = list(dict.fromkeys(descriptions))
+
+    print(
+        f"Found {len(unique_descriptions)} unique descriptions."
+    )
+
+    print("Converting descriptions to romaji...")
+
+    romaji = {
+        text: to_romaji(text)
+        for text in unique_descriptions
+    }
+
+    translations = translate_texts(unique_descriptions)
+
+    print("Applying translations and romaji...")
+
+    for row in rows:
+        for column in range(1, 5):
+            references = json.loads(row[column])
+
+            for index in range(0, len(references), 4):
+                description = references[index + 1]
+
+                references[index + 2] = romaji.get(
+                    description, ""
+                )
+
+                references[index + 3] = translations.get(
+                    description, ""
+                )
+
+            row[column] = json.dumps(
+                references,
+                ensure_ascii=False
+            )
+
+
 def scrape_page():
     response = SESSION.get(PAGE_URL, timeout=60)
     response.raise_for_status()
@@ -191,7 +346,9 @@ def scrape_page():
     soup = BeautifulSoup(response.text, "html.parser")
     rows = []
 
-    containers = soup.select('td.rgncss[id^="rgn_content"]')
+    containers = soup.select(
+        'td.rgncss[id^="rgn_content"]'
+    )
 
     for container in containers:
         heading = container.find_previous("h4")
@@ -210,12 +367,26 @@ def scrape_page():
 
         rows.append([
             title,
-            json.dumps(difficulties["hard"], ensure_ascii=False),
-            json.dumps(difficulties["expert"], ensure_ascii=False),
-            json.dumps(difficulties["master"], ensure_ascii=False),
-            json.dumps(difficulties["append"], ensure_ascii=False),
+            json.dumps(
+                difficulties["hard"],
+                ensure_ascii=False
+            ),
+            json.dumps(
+                difficulties["expert"],
+                ensure_ascii=False
+            ),
+            json.dumps(
+                difficulties["master"],
+                ensure_ascii=False
+            ),
+            json.dumps(
+                difficulties["append"],
+                ensure_ascii=False
+            ),
             notes,
         ])
+
+    enrich_rows(rows)
 
     return rows
 
@@ -242,6 +413,7 @@ def connect_sheet():
 
     try:
         return spreadsheet.worksheet(SHEET_NAME)
+
     except gspread.exceptions.WorksheetNotFound:
         return spreadsheet.add_worksheet(
             title=SHEET_NAME,
@@ -284,7 +456,10 @@ def main():
 
     count = append_to_sheet(rows)
 
-    print(f"=== Done. Appended {count} rows to '{SHEET_NAME}'. ===")
+    print(
+        f"=== Done. Appended {count} rows "
+        f"to '{SHEET_NAME}'. ==="
+    )
 
 
 if __name__ == "__main__":
