@@ -45,6 +45,9 @@ jobs:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         run: python custom.py
 
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
       - name: Run Hololive Database Script
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
