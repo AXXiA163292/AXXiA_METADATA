@@ -8,3 +8,4 @@ google-auth-httplib2
 cloudscraper
 curl_cffi
 playwright
+deep-translator
