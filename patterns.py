@@ -17,6 +17,12 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "deep-translator"])
     from deep_translator import GoogleTranslator
 
+try:
+    from pykakasi import kakasi
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "pykakasi"])
+    from pykakasi import kakasi
+
 
 PAGE_URL = "https://pjsekai.com/?03c3cbe6ba#e9ac9fe1"
 BASE_URL = "https://pjsekai.com/"
@@ -43,11 +49,30 @@ SESSION.headers.update({
 })
 
 TRANSLATIONS = {}
+ROMAJI_CACHE = {}
 TRANSLATOR = GoogleTranslator(source="ja", target="en")
+KAKASI = kakasi()
 
 
 def clean_text(element):
     return re.sub(r"\s+", " ", element.get_text(" ", strip=True)).strip()
+
+
+def to_romaji(text):
+    if not text:
+        return ""
+
+    if text in ROMAJI_CACHE:
+        return ROMAJI_CACHE[text]
+
+    try:
+        converted = "".join(item["hepburn"] for item in KAKASI.convert(text))
+        ROMAJI_CACHE[text] = converted
+        return converted
+    except Exception as error:
+        print(f"    Romaji conversion failed: {error}")
+        ROMAJI_CACHE[text] = ""
+        return ""
 
 
 def translate_text(text):
@@ -95,7 +120,7 @@ def extract_difficulty_table(container):
 
     current_difficulty = None
 
-    for row in table.select("tbody tr"):
+    for row in table.find_all("tr"):
         cells = row.find_all("td", recursive=False)
 
         if not cells:
@@ -134,10 +159,14 @@ def extract_difficulty_table(container):
 
             seen.add(url)
 
+            romaji = to_romaji(description)
+            translation = translate_text(description)
+
             results[current_difficulty].extend([
                 url,
                 description,
-                translate_text(description),
+                romaji,
+                translation,
             ])
 
     return results
