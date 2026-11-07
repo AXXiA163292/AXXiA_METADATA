@@ -3,6 +3,8 @@ import json
 import os
 import re
 import time
+import subprocess
+import sys
 from urllib.parse import urljoin
 
 import requests
@@ -13,8 +15,6 @@ from google.oauth2.service_account import Credentials
 try:
     from pykakasi import kakasi
 except ImportError:
-    import subprocess
-    import sys
     subprocess.check_call([sys.executable, "-m", "pip", "install", "pykakasi"])
     from pykakasi import kakasi
 
@@ -42,6 +42,15 @@ DIFFICULTIES = {
     "APPEND": "append",
     "APD": "append",
     "APP": "append",
+}
+
+DIFFICULTY_ORDER = ["hard", "expert", "master", "append"]
+
+DIFFICULTY_LABELS = {
+    "hard": "HARD",
+    "expert": "EXPERT",
+    "master": "MASTER",
+    "append": "APPEND",
 }
 
 SESSION = requests.Session()
@@ -85,10 +94,8 @@ def get_image_url(img):
 
 def extract_difficulty_table(container):
     results = {
-        "hard": [],
-        "expert": [],
-        "master": [],
-        "append": [],
+        difficulty: []
+        for difficulty in DIFFICULTY_ORDER
     }
 
     table = container.select_one(".ie5 table.style_table")
@@ -97,6 +104,10 @@ def extract_difficulty_table(container):
         return results
 
     current_difficulty = None
+    seen = {
+        difficulty: set()
+        for difficulty in DIFFICULTY_ORDER
+    }
 
     for row in table.find_all("tr"):
         cells = row.find_all("td", recursive=False)
@@ -127,22 +138,19 @@ def extract_difficulty_table(container):
 
         images.extend(description_cell.find_all("img"))
 
-        seen = set()
-
         for img in images:
             url = get_image_url(img)
 
-            if not url or url in seen:
+            if not url or url in seen[current_difficulty]:
                 continue
 
-            seen.add(url)
+            seen[current_difficulty].add(url)
 
-            results[current_difficulty].extend([
-                url,
-                description,
-                "",
-                "",
-            ])
+            results[current_difficulty].append({
+                "url": url,
+                "description": description,
+                "romaji": "",
+            })
 
     return results
 
@@ -160,48 +168,35 @@ def extract_notes(container):
 
 
 def enrich_rows(rows):
-    descriptions = []
+    descriptions = list(dict.fromkeys(
+        entry["description"]
+        for row in rows
+        for difficulty in DIFFICULTY_ORDER
+        for entry in row["difficulties"][difficulty]
+        if entry["description"]
+    ))
 
-    for row in rows:
-        for column in range(1, 5):
-            references = json.loads(row[column])
-
-            descriptions.extend(
-                references[index + 1]
-                for index in range(0, len(references), 4)
-                if references[index + 1]
-            )
-
-    unique_descriptions = list(dict.fromkeys(descriptions))
-
-    print(f"Found {len(unique_descriptions)} unique descriptions.")
+    print(f"Found {len(descriptions)} unique descriptions.")
     print("Converting descriptions to romaji...")
 
     romaji = {}
 
-    for index, text in enumerate(unique_descriptions, 1):
-        romaji[text] = to_romaji(text)
+    for index, description in enumerate(descriptions, 1):
+        romaji[description] = to_romaji(description)
 
         if index % 100 == 0:
-            print(f"  Converted {index}/{len(unique_descriptions)}.")
+            print(f"  Converted {index}/{len(descriptions)}.")
 
     print("Applying romaji...")
 
     for row in rows:
-        for column in range(1, 5):
-            references = json.loads(row[column])
+        for difficulty in DIFFICULTY_ORDER:
+            for entry in row["difficulties"][difficulty]:
+                entry["romaji"] = romaji.get(
+                    entry["description"], ""
+                )
 
-            for index in range(0, len(references), 4):
-                description = references[index + 1]
-                references[index + 2] = romaji.get(description, "")
-                references[index + 3] = ""
-
-            row[column] = json.dumps(
-                references,
-                ensure_ascii=False
-            )
-
-    return unique_descriptions, romaji
+    return descriptions, romaji
 
 
 def scrape_page():
@@ -230,14 +225,11 @@ def scrape_page():
         difficulties = extract_difficulty_table(container)
         notes = extract_notes(container)
 
-        rows.append([
-            title,
-            json.dumps(difficulties["hard"], ensure_ascii=False),
-            json.dumps(difficulties["expert"], ensure_ascii=False),
-            json.dumps(difficulties["master"], ensure_ascii=False),
-            json.dumps(difficulties["append"], ensure_ascii=False),
-            notes,
-        ])
+        rows.append({
+            "title": title,
+            "notes": notes,
+            "difficulties": difficulties,
+        })
 
     descriptions, romaji = enrich_rows(rows)
 
@@ -265,7 +257,7 @@ def connect_spreadsheet():
     return client.open_by_key(SPREADSHEET_ID)
 
 
-def get_or_create_sheet(spreadsheet, name, rows=1000, cols=6):
+def get_or_create_sheet(spreadsheet, name, rows=1000, cols=20):
     try:
         return spreadsheet.worksheet(name)
     except gspread.exceptions.WorksheetNotFound:
@@ -276,46 +268,113 @@ def get_or_create_sheet(spreadsheet, name, rows=1000, cols=6):
         )
 
 
-def append_to_sheet(spreadsheet, rows):
+def build_sheet_data(rows):
+    max_images = {
+        difficulty: max(
+            (
+                len(row["difficulties"][difficulty])
+                for row in rows
+            ),
+            default=0,
+        )
+        for difficulty in DIFFICULTY_ORDER
+    }
+
+    headers = ["Song", "Notes"]
+
+    for difficulty in DIFFICULTY_ORDER:
+        label = DIFFICULTY_LABELS[difficulty]
+        prefix = label.title()
+
+        headers.append(f"{prefix}label ({label})")
+
+        for index in range(1, max_images[difficulty] + 1):
+            headers.extend([
+                f"{prefix}imageurl{index}",
+                f"{prefix}desc{index}",
+                f"{prefix}romaji{index}",
+            ])
+
+    output = [headers]
+
+    for row in rows:
+        values = [
+            row["title"],
+            row["notes"],
+        ]
+
+        for difficulty in DIFFICULTY_ORDER:
+            entries = row["difficulties"][difficulty]
+
+            values.append(
+                DIFFICULTY_LABELS[difficulty] if entries else ""
+            )
+
+            for index in range(max_images[difficulty]):
+                if index < len(entries):
+                    entry = entries[index]
+
+                    values.extend([
+                        entry["url"],
+                        entry["description"],
+                        entry["romaji"],
+                    ])
+                else:
+                    values.extend(["", "", ""])
+
+        output.append(values)
+
+    return output
+
+
+def write_patterns_sheet(spreadsheet, rows):
     if not rows:
-        print("No song sections were extracted.")
+        print("No song sections were extracted. Sheet unchanged.")
         return 0
+
+    data = build_sheet_data(rows)
 
     worksheet = get_or_create_sheet(
         spreadsheet,
         SHEET_NAME,
-        rows=1000,
-        cols=6,
+        rows=max(1000, len(data) + 10),
+        cols=max(20, len(data[0])),
     )
 
-    if not worksheet.acell("A1").value:
-        worksheet.update(
-            range_name="A1:F1",
-            values=[[
-                "Song",
-                "HARD",
-                "EXPERT",
-                "MASTER",
-                "APPEND",
-                "Notes",
-            ]],
-            value_input_option="RAW",
-        )
+    worksheet.resize(
+        rows=max(1000, len(data) + 10),
+        cols=len(data[0]),
+    )
 
-    existing_titles = worksheet.col_values(1)
-    next_row = max(2, len(existing_titles) + 1)
+    worksheet.clear()
 
-    for offset in range(0, len(rows), BATCH_SIZE):
-        batch = rows[offset:offset + BATCH_SIZE]
+    for offset in range(0, len(data), BATCH_SIZE):
+        batch = data[offset:offset + BATCH_SIZE]
+        start = offset + 1
 
         worksheet.update(
-            range_name=f"A{next_row + offset}",
+            range_name=f"A{start}",
             values=batch,
             value_input_option="RAW",
         )
 
-        print(f"  Appended {len(batch)} pattern rows.")
+        print(
+            f"  Updated pattern rows {start}-{start + len(batch) - 1}."
+        )
+
         time.sleep(0.3)
+
+    print(f"Patterns sheet updated: {len(rows)} songs.")
+    print(f"Total columns: {len(data[0])}")
+
+    for difficulty in DIFFICULTY_ORDER:
+        print(
+            f"  {DIFFICULTY_LABELS[difficulty]}: "
+            f"{max(
+                (len(row['difficulties'][difficulty]) for row in rows),
+                default=0
+            )} maximum images"
+        )
 
     return len(rows)
 
@@ -358,6 +417,7 @@ def append_translations(spreadsheet, descriptions, romaji):
             ])
         else:
             current_row = existing[row_number - 1]
+
             current_translation = (
                 current_row[2] if len(current_row) > 2 else ""
             )
@@ -370,7 +430,7 @@ def append_translations(spreadsheet, descriptions, romaji):
                     "range": f"C{row_number}",
                     "values": [[
                         f'=IF(A{row_number}="";"";IFERROR(GOOGLETRANSLATE(A{row_number};"ja";"en");""))'
-                    ]]
+                    ],
                 })
 
     next_row = len(existing) + 1
@@ -407,10 +467,8 @@ def append_translations(spreadsheet, descriptions, romaji):
         time.sleep(0.3)
 
     for offset in range(0, len(formula_updates), BATCH_SIZE):
-        batch = formula_updates[offset:offset + BATCH_SIZE]
-
         worksheet.batch_update(
-            batch,
+            formula_updates[offset:offset + BATCH_SIZE],
             value_input_option="USER_ENTERED",
         )
 
@@ -429,9 +487,13 @@ def main():
 
     print(f"Extracted {len(rows)} song sections.")
 
+    if not rows:
+        print("Aborting: no data extracted.")
+        return
+
     spreadsheet = connect_spreadsheet()
 
-    count = append_to_sheet(spreadsheet, rows)
+    count = write_patterns_sheet(spreadsheet, rows)
 
     translation_count = append_translations(
         spreadsheet,
@@ -440,7 +502,7 @@ def main():
     )
 
     print(
-        f"=== Done. Appended {count} pattern rows. "
+        f"=== Done. Imported {count} songs. "
         f"Processed {translation_count} translation entries. ==="
     )
 
