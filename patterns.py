@@ -21,7 +21,7 @@ except ImportError:
 
 PAGE_URL = "https://pjsekai.com/?03c3cbe6ba#e9ac9fe1"
 BASE_URL = "https://pjsekai.com/"
-SPREADSHEET_ID = "1Fpp_sJbJguKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak"
+SPREADSHEET_ID = "1Fpp_sJbGjuKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak"
 
 SHEET_NAME = "patterns"
 TRANSLATION_SHEET_NAME = "patterns_translations"
@@ -362,12 +362,15 @@ def append_translations(spreadsheet, descriptions, romaji):
                 current_row[2] if len(current_row) > 2 else ""
             )
 
-            if not current_translation or current_translation.startswith("#"):
+            if (
+                not current_translation
+                or current_translation.startswith("#")
+            ):
                 formula_updates.append({
                     "range": f"C{row_number}",
                     "values": [[
                         f'=IF(A{row_number}="";"";IFERROR(GOOGLETRANSLATE(A{row_number};"ja";"en");""))'
-                    ],
+                    ]]
                 })
 
     next_row = len(existing) + 1
@@ -405,6 +408,7 @@ def append_translations(spreadsheet, descriptions, romaji):
 
     for offset in range(0, len(formula_updates), BATCH_SIZE):
         batch = formula_updates[offset:offset + BATCH_SIZE]
+
         worksheet.batch_update(
             batch,
             value_input_option="USER_ENTERED",
