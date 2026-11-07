@@ -3,8 +3,6 @@ import json
 import os
 import re
 import time
-import subprocess
-import sys
 from urllib.parse import urljoin
 
 import requests
@@ -12,26 +10,17 @@ import gspread
 from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 
-try:
-    from pykakasi import kakasi
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pykakasi"])
-    from pykakasi import kakasi
-
 
 PAGE_URL = "https://pjsekai.com/?03c3cbe6ba#e9ac9fe1"
 BASE_URL = "https://pjsekai.com/"
 SPREADSHEET_ID = "1Fpp_sJbGjuKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak"
 
-SHEET_NAME = "patterns"
-TRANSLATION_SHEET_NAME = "patterns_translations"
+SHEET_NAME = "patterns_raw"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SERVICE_ACCOUNT = os.path.join(SCRIPT_DIR, "service_account.json")
 
 BATCH_SIZE = 40
-ROMAJI_CACHE = {}
-KAKASI = kakasi()
 
 DIFFICULTIES = {
     "HARD": "hard",
@@ -44,13 +33,20 @@ DIFFICULTIES = {
     "APP": "append",
 }
 
-DIFFICULTY_ORDER = ["hard", "expert", "master", "append"]
+DIFFICULTY_ORDER = ["append", "master", "expert", "hard"]
 
 DIFFICULTY_LABELS = {
-    "hard": "HARD",
-    "expert": "EXPERT",
-    "master": "MASTER",
     "append": "APPEND",
+    "master": "MASTER",
+    "expert": "EXPERT",
+    "hard": "HARD",
+}
+
+DIFFICULTY_PREFIXES = {
+    "append": "ap",
+    "master": "ms",
+    "expert": "ex",
+    "hard": "hr",
 }
 
 SESSION = requests.Session()
@@ -61,26 +57,6 @@ SESSION.headers.update({
 
 def clean_text(element):
     return re.sub(r"\s+", " ", element.get_text(" ", strip=True)).strip()
-
-
-def to_romaji(text):
-    if not text:
-        return ""
-
-    if text in ROMAJI_CACHE:
-        return ROMAJI_CACHE[text]
-
-    try:
-        converted = "".join(
-            item["hepburn"] for item in KAKASI.convert(text)
-        )
-        ROMAJI_CACHE[text] = converted
-        return converted
-
-    except Exception as error:
-        print(f"    Romaji conversion failed: {error}")
-        ROMAJI_CACHE[text] = ""
-        return ""
 
 
 def get_image_url(img):
@@ -149,7 +125,6 @@ def extract_difficulty_table(container):
             results[current_difficulty].append({
                 "url": url,
                 "description": description,
-                "romaji": "",
             })
 
     return results
@@ -165,38 +140,6 @@ def extract_notes(container):
             notes.append(text)
 
     return " ".join(notes)
-
-
-def enrich_rows(rows):
-    descriptions = list(dict.fromkeys(
-        entry["description"]
-        for row in rows
-        for difficulty in DIFFICULTY_ORDER
-        for entry in row["difficulties"][difficulty]
-        if entry["description"]
-    ))
-
-    print(f"Found {len(descriptions)} unique descriptions.")
-    print("Converting descriptions to romaji...")
-
-    romaji = {}
-
-    for index, description in enumerate(descriptions, 1):
-        romaji[description] = to_romaji(description)
-
-        if index % 100 == 0:
-            print(f"  Converted {index}/{len(descriptions)}.")
-
-    print("Applying romaji...")
-
-    for row in rows:
-        for difficulty in DIFFICULTY_ORDER:
-            for entry in row["difficulties"][difficulty]:
-                entry["romaji"] = romaji.get(
-                    entry["description"], ""
-                )
-
-    return descriptions, romaji
 
 
 def scrape_page():
@@ -231,9 +174,7 @@ def scrape_page():
             "difficulties": difficulties,
         })
 
-    descriptions, romaji = enrich_rows(rows)
-
-    return rows, descriptions, romaji
+    return rows
 
 
 def connect_spreadsheet():
@@ -284,15 +225,14 @@ def build_sheet_data(rows):
 
     for difficulty in DIFFICULTY_ORDER:
         label = DIFFICULTY_LABELS[difficulty]
-        prefix = label.title()
+        prefix = DIFFICULTY_PREFIXES[difficulty]
 
-        headers.append(f"{prefix}label ({label})")
+        headers.append(label)
 
-        for index in range(1, max_images[difficulty] + 1):
+        for _ in range(max_images[difficulty]):
             headers.extend([
-                f"{prefix}imageurl{index}",
-                f"{prefix}desc{index}",
-                f"{prefix}romaji{index}",
+                f"{prefix}PatternUrl",
+                f"{prefix}PatternDesc",
             ])
 
     output = [headers]
@@ -317,10 +257,9 @@ def build_sheet_data(rows):
                     values.extend([
                         entry["url"],
                         entry["description"],
-                        entry["romaji"],
                     ])
                 else:
-                    values.extend(["", "", ""])
+                    values.extend(["", ""])
 
         output.append(values)
 
@@ -378,117 +317,16 @@ def write_patterns_sheet(spreadsheet, rows):
 
         print(
             f"  {DIFFICULTY_LABELS[difficulty]}: "
-            f"{maximum} maximum images"
+            f"{maximum} maximum patterns"
         )
 
     return len(rows)
 
 
-def append_translations(spreadsheet, descriptions, romaji):
-    if not descriptions:
-        return 0
-
-    worksheet = get_or_create_sheet(
-        spreadsheet,
-        TRANSLATION_SHEET_NAME,
-        rows=1000,
-        cols=3,
-    )
-
-    if not worksheet.acell("A1").value:
-        worksheet.update(
-            range_name="A1:C1",
-            values=[["Japanese", "Romaji", "English"]],
-            value_input_option="RAW",
-        )
-
-    existing = worksheet.get_all_values()
-    existing_rows = {}
-
-    for row_number, row in enumerate(existing[1:], start=2):
-        if row and row[0]:
-            existing_rows[row[0]] = row_number
-
-    new_rows = []
-    formula_updates = []
-
-    for description in descriptions:
-        row_number = existing_rows.get(description)
-
-        if row_number is None:
-            new_rows.append([
-                description,
-                romaji.get(description, ""),
-            ])
-        else:
-            current_row = existing[row_number - 1]
-
-            current_translation = (
-                current_row[2] if len(current_row) > 2 else ""
-            )
-
-            if (
-                not current_translation
-                or current_translation.startswith("#")
-            ):
-                formula_updates.append({
-                    "range": f"C{row_number}",
-                    "values": [[
-                        f'=IF(A{row_number}="";"";IFERROR(GOOGLETRANSLATE(A{row_number};"ja";"en");""))'
-                    ]],
-                })
-
-    next_row = len(existing) + 1
-
-    for offset in range(0, len(new_rows), BATCH_SIZE):
-        batch = new_rows[offset:offset + BATCH_SIZE]
-        start = next_row + offset
-        end = start + len(batch) - 1
-
-        worksheet.update(
-            range_name=f"A{start}:B{end}",
-            values=batch,
-            value_input_option="RAW",
-        )
-
-        formulas = [
-            [
-                f'=IF(A{row_number}="";"";IFERROR(GOOGLETRANSLATE(A{row_number};"ja";"en");""))'
-            ]
-            for row_number in range(start, end + 1)
-        ]
-
-        worksheet.update(
-            range_name=f"C{start}:C{end}",
-            values=formulas,
-            value_input_option="USER_ENTERED",
-        )
-
-        print(
-            f"  Added {len(batch)} translation formulas "
-            f"({start}-{end})."
-        )
-
-        time.sleep(0.3)
-
-    for offset in range(0, len(formula_updates), BATCH_SIZE):
-        worksheet.batch_update(
-            formula_updates[offset:offset + BATCH_SIZE],
-            value_input_option="USER_ENTERED",
-        )
-
-    total = len(new_rows) + len(formula_updates)
-
-    print(f"Translation formulas added or restored: {total}")
-    print("Google Sheets will calculate the translations.")
-
-    return total
-
-
 def main():
     print("=== PATTERNS scraper started ===")
 
-    rows, descriptions, romaji = scrape_page()
+    rows = scrape_page()
 
     print(f"Extracted {len(rows)} song sections.")
 
@@ -500,15 +338,8 @@ def main():
 
     count = write_patterns_sheet(spreadsheet, rows)
 
-    translation_count = append_translations(
-        spreadsheet,
-        descriptions,
-        romaji,
-    )
-
     print(
-        f"=== Done. Imported {count} songs. "
-        f"Processed {translation_count} translation entries. ==="
+        f"=== Done. Imported {count} songs into {SHEET_NAME}. ==="
     )
 
 
