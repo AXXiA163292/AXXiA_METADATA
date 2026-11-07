@@ -1,10 +1,12 @@
+
+import asyncio
 import datetime
 import json
 import os
 import re
 import subprocess
 import sys
-import time
+from urllib.parse import urljoin, urlparse
 
 REQUIRED = {
     'playwright': 'playwright',
@@ -14,334 +16,557 @@ REQUIRED = {
 }
 
 for mod, pkg in REQUIRED.items():
-  try:
-    __import__(mod)
-  except ImportError:
-    subprocess.check_call([sys.executable, '-m', 'pip', 'install', pkg])
-    if mod == 'playwright':
-      subprocess.check_call(
-          [sys.executable, '-m', 'playwright', 'install', 'chromium']
-      )
+    try:
+        __import__(mod)
+    except ImportError:
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', pkg])
+        if mod == 'playwright':
+            subprocess.check_call([
+                sys.executable, '-m', 'playwright', 'install', 'chromium'
+            ])
 
 from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
-from playwright.sync_api import sync_playwright
-import requests
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 SPREADSHEET_ID = '1Fpp_sJbGjuKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak'
 SHEET_NAME = 'hololive'
+BASE_URL = 'https://holodori.best'
+SONGS_URL = f'{BASE_URL}/songs'
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SERVICE_ACCOUNT = os.path.join(SCRIPT_DIR, 'service_account.json')
 IS_GITHUB_ACTIONS = os.environ.get('GITHUB_ACTIONS') == 'true'
 
+CONCURRENCY = 5
+PAGE_TIMEOUT = 25000
+DISCOVERY_SCROLLS = 30
 
-def format_release_date(date_str):
-  """Converts release date strings like 'August 29, 2026 at 5:00 AM GMT+2'
+HEADERS = [
+    'musicId',
+    'title',
+    'artist',
+    'composer',
+    'lyricist',
+    'arranger',
+    'duration',
+    'releaseDate',
+    'jacketUrl',
+    'audioUrl',
+    'hasMv',
+    'pageUrl',
+    'ezPlayLevel',
+    'ezTotalNoteCount',
+    'ezChartUrl',
+    'normalPlayLevel',
+    'normalTotalNoteCount',
+    'normalChartUrl',
+    'hardPlayLevel',
+    'hardTotalNoteCount',
+    'hardChartUrl',
+    'expertPlayLevel',
+    'expertTotalNoteCount',
+    'expertChartUrl',
+]
 
-  to '29/08/26 05:00:00'.
-  """
-  if not date_str or date_str == '-':
-    return '-'
-  try:
-    cleaned = re.sub(r'\s+(GMT|UTC)[+-]?\d*', '', date_str).strip()
-    dt = datetime.datetime.strptime(cleaned, '%B %d, %Y at %I:%M %p')
-    return dt.strftime('%d/%m/%y %H:%M:%S')
-  except Exception:
-    try:
-      cleaned = re.sub(r'\s+(GMT|UTC)[+-]?\d*', '', date_str).strip()
-      dt = datetime.datetime.strptime(cleaned, '%B %d, %Y %I:%M %p')
-      return dt.strftime('%d/%m/%y %H:%M:%S')
-    except Exception:
-      return date_str
+DIFFICULTIES = ['easy', 'normal', 'hard', 'expert']
+
+DIFF_NAMES = {
+    'easy': ['easy', 'ez'],
+    'normal': ['normal', 'norm'],
+    'hard': ['hard'],
+    'expert': ['expert', 'ex'],
+}
 
 
-def get_all_song_ids_via_playwright(base_url):
-  """Intercepts API network traffic or scrapes song cards directly using Playwright
+def clean(value):
+    if value is None:
+        return '-'
+    value = re.sub(r'\s+', ' ', str(value)).strip()
+    return value if value else '-'
 
-  to ensure all songs are collected without missing any.
-  """
-  song_ids = set()
-  print('Fetching song list...')
 
-  with sync_playwright() as p:
-    browser = p.chromium.launch(headless=True)
-    page = browser.new_page()
+def absolute_url(value, page_url):
+    if not value:
+        return '-'
+    value = value.strip()
+    if value.startswith(('data:', 'blob:', 'javascript:')):
+        return '-'
+    return urljoin(page_url, value)
 
-    # Intercept network responses to grab the raw json data if it fetches via XHR/fetch
-    def handle_response(response):
-      if 'api/songs' in response.url:
+
+def format_release_date(value):
+    value = clean(value)
+    if value == '-':
+        return '-'
+
+    patterns = [
+        '%B %d, %Y at %I:%M %p',
+        '%B %d, %Y %I:%M %p',
+        '%B %d, %Y',
+    ]
+
+    cleaned = re.sub(r'\s+(UTC|GMT)([+-]\d{1,2})?', '', value).strip()
+
+    for pattern in patterns:
         try:
-          data = response.json()
+            dt = datetime.datetime.strptime(cleaned, pattern)
+            return dt.strftime('%d/%m/%y %H:%M:%S')
+        except ValueError:
+            continue
 
-          def extract(item):
-            if isinstance(item, dict):
-              sid = item.get('musicId') or item.get('id')
-              if sid:
-                song_ids.add(str(sid))
-              for v in item.values():
-                if isinstance(v, (list, dict)):
-                  extract(v)
-            elif isinstance(item, list):
-              for sub in item:
-                extract(sub)
+    return value
 
-          extract(data)
-        except Exception:
-          pass
 
-    page.on('response', handle_response)
+def get_label_value(soup, wanted):
+    wanted = wanted.casefold()
 
-    try:
-      # Go to songs index or main page
-      page.goto(f'{base_url}/songs', wait_until='networkidle', timeout=15000)
-    except Exception:
-      try:
-        page.goto(base_url, wait_until='networkidle', timeout=15000)
-      except Exception as e:
-        print(f'  [warn] Navigation timeout or error: {e}')
+    for dt in soup.find_all('dt'):
+        label = clean(dt.get_text(' ', strip=True)).casefold()
+        dd = dt.find_next_sibling('dd')
 
-    # Also scrape DOM elements directly in case IDs are rendered inside links/cards
-    try:
-      page.wait_for_selector('a[href*="/songs/"]', timeout=5000)
-    except Exception:
-      pass
+        if dd and wanted in label:
+            return clean(dd.get_text(' ', strip=True))
 
-    anchors = page.eval_on_selector_all(
-        'a[href*="/songs/"]', 'elements => elements.map(e => e.href)'
+    # Fallback for label/value structures not using dt/dd.
+    for element in soup.find_all(['div', 'li', 'p']):
+        text = clean(element.get_text(' ', strip=True))
+        if ':' in text:
+            label, value = text.split(':', 1)
+            if label.strip().casefold() == wanted:
+                return clean(value)
+
+    return '-'
+
+
+def extract_difficulties(soup, body_text, music_id, page_url):
+    result = {
+        diff: {'level': '-', 'notes': '-', 'chartUrl': '-'}
+        for diff in DIFFICULTIES
+    }
+
+    # First inspect rendered elements containing difficulty information.
+    candidates = soup.find_all(
+        lambda tag: tag.name in ['button', 'div', 'a', 'section', 'article']
+        and tag.get_text(' ', strip=True)
+        and len(tag.get_text(' ', strip=True)) < 500
     )
-    for href in anchors:
-      match = re.search(r'/songs/([m]?\d+)', href)
-      if match:
-        song_ids.add(match.group(1))
 
-    browser.close()
+    for element in candidates:
+        text = clean(element.get_text(' ', strip=True))
+        lowered = text.casefold()
 
-  # Fallback if still empty
-  if not song_ids:
-    print('  [info] Using expanded fallback song ID sequence generator.')
-    for i in range(1, 200):
-      song_ids.add(f'm{i:04d}')
+        for diff in DIFFICULTIES:
+            if result[diff]['level'] != '-':
+                continue
 
-  def sort_key(sid):
-    num = re.sub(r'\D', '', sid)
-    return int(num) if num.isdigit() else 999999
+            if not any(name in lowered for name in DIFF_NAMES[diff]):
+                continue
 
-  sorted_ids = sorted(list(song_ids), key=sort_key)
-  print(f'-> {len(sorted_ids)} songs\n')
-  return sorted_ids
+            level_match = re.search(
+                r'(?:^|\s)(\d{1,2})(?:\s|$)',
+                text
+            )
+            notes_match = re.search(
+                r'([\d,]+)\s*combo',
+                text,
+                re.I
+            )
+
+            if level_match and notes_match:
+                result[diff]['level'] = level_match.group(1)
+                result[diff]['notes'] = notes_match.group(1).replace(',', '')
+
+    # Text fallback based on the actual visible difficulty listing.
+    normalized_text = re.sub(r'\s+', ' ', body_text)
+
+    for diff in DIFFICULTIES:
+        if result[diff]['level'] != '-':
+            continue
+
+        names = '|'.join(DIFF_NAMES[diff])
+        match = re.search(
+            rf'(\d{{1,2}})\s*(?:{names})\s*([\d,]+)\s*combo',
+            normalized_text,
+            re.I
+        )
+
+        if match:
+            result[diff]['level'] = match.group(1)
+            result[diff]['notes'] = match.group(2).replace(',', '')
+
+    # Extract only real chart URLs found in the rendered page.
+    for element in soup.find_all(['a', 'img', 'source', 'iframe']):
+        raw_url = (
+            element.get('href')
+            or element.get('src')
+            or element.get('data-src')
+            or ''
+        )
+
+        if not raw_url:
+            continue
+
+        url = absolute_url(raw_url, page_url)
+        lowered = url.casefold()
+
+        if url == '-':
+            continue
+
+        for diff in DIFFICULTIES:
+            if result[diff]['chartUrl'] != '-':
+                continue
+
+            diff_names = DIFF_NAMES[diff]
+            matches_id = music_id.casefold() in lowered
+            matches_diff = any(name in lowered for name in diff_names)
+            looks_like_chart = any(
+                token in lowered
+                for token in ['chart', '.sus', 'score', 'difficulty']
+            )
+
+            if matches_id and matches_diff and looks_like_chart:
+                result[diff]['chartUrl'] = url
+
+    return result
+
+
+def extract_song(soup, body_text, music_id, page_url):
+    title_tag = soup.find('h1')
+    title = clean(title_tag.get_text(' ', strip=True) if title_tag else '-')
+
+    if title == '-':
+        title = '-'
+
+    artist = get_label_value(soup, 'artist')
+    composer = get_label_value(soup, 'composer')
+    lyricist = get_label_value(soup, 'lyricist')
+    arranger = get_label_value(soup, 'arranger')
+    duration = get_label_value(soup, 'duration')
+    release_date = format_release_date(
+        get_label_value(soup, 'release date')
+    )
+
+    mv_match = re.search(
+        r'Has In-game MV\?\s*(Yes|No)',
+        body_text,
+        re.I
+    )
+    has_mv = mv_match.group(1).capitalize() if mv_match else '-'
+
+    # Use actual image URLs from the song page.
+    jacket_url = '-'
+
+    for img in soup.find_all('img'):
+        src = img.get('src') or img.get('data-src') or ''
+        alt = (img.get('alt') or '').casefold()
+        lowered = src.casefold()
+
+        if (
+            'jacket' in lowered
+            or 'jacket' in alt
+            or music_id.casefold() in lowered
+            and 'img' in lowered
+        ):
+            jacket_url = absolute_url(src, page_url)
+            break
+
+    # Use actual audio/source elements or audio links.
+    audio_url = '-'
+
+    for element in soup.find_all(['audio', 'source', 'a']):
+        raw_url = (
+            element.get('src')
+            or element.get('href')
+            or ''
+        )
+
+        if raw_url and (
+            'audio' in raw_url.casefold()
+            or raw_url.casefold().endswith(('.mp3', '.ogg', '.wav', '.m4a'))
+        ):
+            audio_url = absolute_url(raw_url, page_url)
+            break
+
+    difficulties = extract_difficulties(
+        soup,
+        body_text,
+        music_id,
+        page_url
+    )
+
+    return [
+        music_id,
+        title,
+        artist,
+        composer,
+        lyricist,
+        arranger,
+        duration,
+        release_date,
+        jacket_url,
+        audio_url,
+        has_mv,
+        page_url,
+        difficulties['easy']['level'],
+        difficulties['easy']['notes'],
+        difficulties['easy']['chartUrl'],
+        difficulties['normal']['level'],
+        difficulties['normal']['notes'],
+        difficulties['normal']['chartUrl'],
+        difficulties['hard']['level'],
+        difficulties['hard']['notes'],
+        difficulties['hard']['chartUrl'],
+        difficulties['expert']['level'],
+        difficulties['expert']['notes'],
+        difficulties['expert']['chartUrl'],
+    ]
+
+
+async def discover_song_ids(browser):
+    print('Discovering actual songs from the website...')
+
+    page = await browser.new_page()
+    await page.goto(
+        SONGS_URL,
+        wait_until='domcontentloaded',
+        timeout=PAGE_TIMEOUT
+    )
+
+    try:
+        await page.wait_for_selector('a[href*="/songs/"]', timeout=12000)
+    except PlaywrightTimeoutError:
+        pass
+
+    song_ids = set()
+    previous_count = -1
+    stable_rounds = 0
+
+    for _ in range(DISCOVERY_SCROLLS):
+        hrefs = await page.locator('a[href*="/songs/"]').evaluate_all(
+            '(els) => els.map(e => e.href)'
+        )
+
+        for href in hrefs:
+            match = re.search(r'/songs/(m\d+)(?:[/?#]|$)', href, re.I)
+            if match:
+                song_ids.add(match.group(1).lower())
+
+        if len(song_ids) == previous_count:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+
+        if stable_rounds >= 4:
+            break
+
+        previous_count = len(song_ids)
+
+        await page.evaluate(
+            'window.scrollTo(0, document.body.scrollHeight)'
+        )
+        await page.wait_for_timeout(350)
+
+    await page.close()
+
+    if not song_ids:
+        raise RuntimeError(
+            'No real song links were found on /songs. '
+            'The scraper stopped instead of inventing IDs.'
+        )
+
+    def sort_key(song_id):
+        match = re.search(r'\d+', song_id)
+        return int(match.group()) if match else 999999
+
+    result = sorted(song_ids, key=sort_key)
+
+    print(f'Found {len(result)} actual song links.')
+    return result
+
+
+async def scrape_one_song(browser, semaphore, index, total, music_id):
+    page_url = f'{BASE_URL}/songs/{music_id}'
+
+    async with semaphore:
+        page = await browser.new_page()
+
+        try:
+            response = await page.goto(
+                page_url,
+                wait_until='domcontentloaded',
+                timeout=PAGE_TIMEOUT
+            )
+
+            if response is None:
+                raise RuntimeError('No HTTP response')
+
+            if response.status >= 400:
+                raise RuntimeError(f'HTTP {response.status}')
+
+            try:
+                await page.wait_for_selector('h1', timeout=10000)
+            except PlaywrightTimeoutError:
+                pass
+
+            # Allow client-rendered metadata to finish loading.
+            await page.wait_for_timeout(300)
+
+            html = await page.content()
+            body_text = await page.locator('body').inner_text()
+
+            soup = BeautifulSoup(html, 'html.parser')
+
+            title_tag = soup.find('h1')
+            title = clean(
+                title_tag.get_text(' ', strip=True)
+                if title_tag else '-'
+            )
+
+            # Do not write a fabricated ID-as-title record.
+            if title == '-' or title.casefold() == music_id.casefold():
+                raise RuntimeError(
+                    'Song page did not provide a real title'
+                )
+
+            row = extract_song(
+                soup,
+                body_text,
+                music_id,
+                page_url
+            )
+
+            print(
+                f'[{index}/{total}] {music_id} | {row[1]}'
+            )
+
+            return row
+
+        except Exception as error:
+            print(f'[failed] {music_id}: {error}')
+            return None
+
+        finally:
+            await page.close()
+
+
+async def scrape_website():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+
+        try:
+            song_ids = await discover_song_ids(browser)
+            semaphore = asyncio.Semaphore(CONCURRENCY)
+
+            tasks = [
+                scrape_one_song(
+                    browser,
+                    semaphore,
+                    index,
+                    len(song_ids),
+                    music_id
+                )
+                for index, music_id in enumerate(song_ids, 1)
+            ]
+
+            results = await asyncio.gather(*tasks)
+
+            rows = [row for row in results if row is not None]
+            failed = len(song_ids) - len(rows)
+
+            print('\nScraping summary')
+            print(f'  Discovered: {len(song_ids)}')
+            print(f'  Successfully scraped: {len(rows)}')
+            print(f'  Failed: {failed}')
+
+            if not rows:
+                raise RuntimeError(
+                    'No song pages were successfully scraped. '
+                    'Google Sheets was not modified.'
+                )
+
+            return rows
+
+        finally:
+            await browser.close()
+
+
+def write_to_google_sheets(rows):
+    print('\nConnecting to Google Sheets...')
+
+    scopes = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive',
+    ]
+
+    if os.environ.get('GCP_SA_KEY'):
+        credentials = Credentials.from_service_account_info(
+            json.loads(os.environ['GCP_SA_KEY']),
+            scopes=scopes
+        )
+    else:
+        credentials = Credentials.from_service_account_file(
+            SERVICE_ACCOUNT,
+            scopes=scopes
+        )
+
+    gc = gspread.authorize(credentials)
+    spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+
+    values = [HEADERS] + rows
+
+    try:
+        worksheet = spreadsheet.worksheet(SHEET_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(
+            title=SHEET_NAME,
+            rows=max(100, len(values) + 10),
+            cols=len(HEADERS)
+        )
+
+    worksheet.clear()
+    worksheet.resize(
+        rows=max(100, len(values) + 10),
+        cols=len(HEADERS)
+    )
+
+    chunk_size = 1000
+
+    for start in range(0, len(values), chunk_size):
+        chunk = values[start:start + chunk_size]
+        end_row = start + len(chunk)
+
+        worksheet.update(
+            range_name=f'A{start + 1}:X{end_row}',
+            values=chunk,
+            value_input_option='RAW'
+        )
+
+        print(f'  Written rows {start + 1}-{end_row}')
+
+    print(
+        f'\nDone. {len(rows)} songs written to {SHEET_NAME}.'
+    )
 
 
 def SCRAPE_HOLODORI():
-  print('=== HOLODORI BEST HTML RENDERED SCRAPER started ===')
-  base_url = 'https://holodori.best'
+    print('=== HOLODORI WEBSITE SCRAPER ===')
 
-  headers = [
-      'musicId',
-      'title',
-      'artist',
-      'composer',
-      'lyricist',
-      'arranger',
-      'duration',
-      'releaseDate',
-      'jacketUrl',
-      'audioUrl',
-      'hasMv',
-      'pageUrl',
-      'ezPlayLevel',
-      'ezTotalNoteCount',
-      'ezChartUrl',
-      'normalPlayLevel',
-      'normalTotalNoteCount',
-      'normalChartUrl',
-      'hardPlayLevel',
-      'hardTotalNoteCount',
-      'hardChartUrl',
-      'expertPlayLevel',
-      'expertTotalNoteCount',
-      'expertChartUrl',
-  ]
+    rows = asyncio.run(scrape_website())
 
-  meta_rows = [headers]
+    # Do not clear the existing sheet unless scraping produced data.
+    write_to_google_sheets(rows)
 
-  song_ids = get_all_song_ids_via_playwright(base_url)
-  total_songs = len(song_ids)
-
-  with sync_playwright() as p:
-    browser = p.chromium.launch(headless=True)
-    page = browser.new_page()
-
-    for idx, music_id in enumerate(song_ids):
-      page_url = f'{base_url}/songs/{music_id}'
-
-      title = music_id
-      artist = composer = lyricist = arranger = duration = release_date = '-'
-      jacket_url = f'https://cdn.holodori.dev/assets/assetbundles/img_music_jacket_{music_id}/img_music_jacket_{music_id}.webp'
-      audio_url = f'https://api.holodori.best/api/songs/{music_id}/audio'
-      has_mv = 'No'
-
-      diff_data = {
-          'easy': {'level': '-', 'notes': '-', 'chartUrl': '-'}.copy(),
-          'normal': {'level': '-', 'notes': '-', 'chartUrl': '-'}.copy(),
-          'hard': {'level': '-', 'notes': '-', 'chartUrl': '-'}.copy(),
-          'expert': {'level': '-', 'notes': '-', 'chartUrl': '-'}.copy(),
-      }
-
-      try:
-        page.goto(page_url, wait_until='domcontentloaded')
-        try:
-          page.wait_for_selector('.song-detail-title', timeout=10000)
-        except Exception:
-          pass
-
-        html_content = page.content()
-        soup = BeautifulSoup(html_content, 'html.parser')
-
-        # 1. Title
-        t_elem = soup.find('h1', class_='song-detail-title')
-        if t_elem and t_elem.text.strip():
-          title = t_elem.text.strip()
-
-        # 2. Jacket
-        j_img = soup.find('img', class_='song-detail-jacket')
-        if j_img and j_img.get('src'):
-          jacket_url = j_img['src'].split('?')[0]
-
-        # 3. Metadata (<dl class="song-meta">)
-        meta_list = soup.find('dl', class_='song-meta')
-        if meta_list:
-          for row in meta_list.find_all('div', class_='song-meta-row'):
-            dt, dd = row.find('dt'), row.find('dd')
-            if dt and dd:
-              k = dt.text.strip().lower()
-              v = dd.text.strip()
-              if 'artist' in k:
-                artist = v
-              elif 'composer' in k:
-                composer = v
-              elif 'lyricist' in k:
-                lyricist = v
-              elif 'arranger' in k:
-                arranger = v
-              elif 'duration' in k:
-                duration = v
-              elif 'release' in k:
-                release_date = format_release_date(v)
-
-        # 4. MV Status
-        mv_section = soup.find(class_='mv-section')
-        if mv_section and 'Yes' in mv_section.text:
-          has_mv = 'Yes'
-
-        # 5. Difficulties / Charts
-        for diff in soup.find_all(['button', 'div'], class_='diff-card'):
-          lvl_tag = diff.find('span', class_='diff-circle')
-          dname_tag = diff.find('span', class_='diff-card-name')
-          notes_tag = diff.find('span', class_='diff-card-notes')
-
-          if dname_tag and dname_tag.text.strip():
-            dname = dname_tag.text.strip().lower()
-            target_k = None
-            if 'easy' in dname or dname == 'ez':
-              target_k = 'easy'
-            elif 'normal' in dname or dname == 'norm':
-              target_k = 'normal'
-            elif 'hard' in dname:
-              target_k = 'hard'
-            elif 'expert' in dname or dname == 'ex':
-              target_k = 'expert'
-
-            if target_k and diff_data[target_k]['level'] == '-':
-              lvl = lvl_tag.text.strip() if lvl_tag else '-'
-              notes_raw = notes_tag.text.strip() if notes_tag else '-'
-              notes_match = re.search(r'\d+', notes_raw.replace('\u202f', ''))
-              notes = notes_match.group(0) if notes_match else '-'
-              chart_url = f'https://cdn.holodori.dev/assets/resources/chart_{music_id}_{target_k}.sus/chart_{music_id}_{target_k}.png'
-
-              diff_data[target_k] = {
-                  'level': lvl,
-                  'notes': notes,
-                  'chartUrl': chart_url,
-              }
-      except Exception as err:
-        print(f'  [warn] Error parsing {music_id}: {err}')
-
-      print(f'  [{idx+1}/{total_songs}] {music_id} • {title}')
-
-      meta_rows.append([
-          music_id,
-          title,
-          artist,
-          composer,
-          lyricist,
-          arranger,
-          duration,
-          release_date,
-          jacket_url,
-          audio_url,
-          has_mv,
-          page_url,
-          diff_data['easy']['level'],
-          diff_data['easy']['notes'],
-          diff_data['easy']['chartUrl'],
-          diff_data['normal']['level'],
-          diff_data['normal']['notes'],
-          diff_data['normal']['chartUrl'],
-          diff_data['hard']['level'],
-          diff_data['hard']['notes'],
-          diff_data['hard']['chartUrl'],
-          diff_data['expert']['level'],
-          diff_data['expert']['notes'],
-          diff_data['expert']['chartUrl'],
-      ])
-
-    browser.close()
-
-  print('\nWriting to Google Sheets...')
-  scopes = [
-      'https://www.googleapis.com/auth/spreadsheets',
-      'https://www.googleapis.com/auth/drive',
-  ]
-  if os.environ.get('GCP_SA_KEY'):
-    creds = Credentials.from_service_account_info(
-        json.loads(os.environ['GCP_SA_KEY']), scopes=scopes
-    )
-  else:
-    creds = Credentials.from_service_account_file(
-        SERVICE_ACCOUNT, scopes=scopes
-    )
-
-  gc = gspread.authorize(creds)
-  ss = gc.open_by_key(SPREADSHEET_ID)
-
-  try:
-    ws = ss.worksheet(SHEET_NAME)
-    ws.clear()
-  except gspread.exceptions.WorksheetNotFound:
-    ws = ss.add_worksheet(
-        title=SHEET_NAME, rows=max(len(meta_rows) + 5, 100), cols=26
-    )
-
-  CHUNK = 5000
-  for i in range(0, len(meta_rows), CHUNK):
-    ws.update(
-        range_name=f'A{i + 1}',
-        values=meta_rows[i : i + CHUNK],
-        value_input_option='RAW',
-    )
-
-  print('=== Done Successfully ===')
+    print('=== SCRAPE COMPLETED ===')
 
 
 if __name__ == '__main__':
-  try:
-    SCRAPE_HOLODORI()
-  except Exception as e:
-    import traceback
-
-    traceback.print_exc()
-  finally:
-    if not IS_GITHUB_ACTIONS:
-      input('Press Enter to exit...')
+    try:
+        SCRAPE_HOLODORI()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+    finally:
+        if not IS_GITHUB_ACTIONS:
+            input('Press Enter to exit...')
