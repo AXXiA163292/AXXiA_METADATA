@@ -368,12 +368,17 @@ def write_patterns_sheet(spreadsheet, rows):
     print(f"Total columns: {len(data[0])}")
 
     for difficulty in DIFFICULTY_ORDER:
+        maximum = max(
+            (
+                len(row["difficulties"][difficulty])
+                for row in rows
+            ),
+            default=0,
+        )
+
         print(
             f"  {DIFFICULTY_LABELS[difficulty]}: "
-            f"{max(
-                (len(row['difficulties'][difficulty]) for row in rows),
-                default=0
-            )} maximum images"
+            f"{maximum} maximum images"
         )
 
     return len(rows)
@@ -430,7 +435,7 @@ def append_translations(spreadsheet, descriptions, romaji):
                     "range": f"C{row_number}",
                     "values": [[
                         f'=IF(A{row_number}="";"";IFERROR(GOOGLETRANSLATE(A{row_number};"ja";"en");""))'
-                    ],
+                    ]],
                 })
 
     next_row = len(existing) + 1
