@@ -25,10 +25,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Judgment Script
+      - name: Run Community Script
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-        run: python judgment.py
+        run: python community.py
 
       - name: Run Database Script
         env:
