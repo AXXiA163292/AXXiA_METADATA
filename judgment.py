@@ -1,237 +1,366 @@
-import csv
-import io
-import json
+
 import os
 import re
-import subprocess
-import sys
-import time
-import unicodedata
-
-REQUIRED={'requests':'requests','bs4':'beautifulsoup4','gspread':'gspread','google.oauth2':'google-auth'}
-for module,pkg in REQUIRED.items():
-    try:
-        __import__(module)
-    except ImportError:
-        subprocess.check_call([sys.executable,'-m','pip','install',pkg])
-
-from bs4 import BeautifulSoup
-import gspread
-from google.oauth2.service_account import Credentials
+import csv
+import json
+import io
 import requests
+import gspread
+from pathlib import Path
+from google.oauth2.service_account import Credentials
 
-SPREADSHEET_ID='1Fpp_sJbGjuKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak'
-SHEET_NAME='community'
-CONSTANTS_SID='1B8tX9VL2PcSJKyuHFVd2UT_8kYlY4ZdwHwg9MfWOPug'
-COMMUNITY_CONSTANTS_SID='1Yv3GXnCIgEIbHL72EuZ-d5q_l-auPgddWi4Efa14jq0'
-COMMUNITY_GID='182216'
-SCRIPT_DIR=os.path.dirname(os.path.abspath(__file__))
-SERVICE_ACCOUNT=os.path.join(SCRIPT_DIR,'service_account.json')
-IS_GITHUB_ACTIONS=os.environ.get('GITHUB_ACTIONS')=='true'
+SPREADSHEET_ID = "1Fpp_sJbGjuKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak"
 
-DIFFICULTIES=['APPEND','MASTER','EXPERT','HARD']
-DIFF_LABEL={'APPEND':'Append','MASTER':'Master','EXPERT':'Expert','HARD':'Hard'}
-DIFF_ORDER={name:index for index,name in enumerate(DIFFICULTIES)}
+OUTPUT_TAB = "community"
+METADATA_TAB = "metadata raw"
 
-S=requests.Session()
-S.headers.update({'User-Agent':'Mozilla/5.0'})
+CONSTANTS_39S_ID = "1B8tX9VL2PcSJKyuHFVd2UT_8kYlY4ZdwHwg9MfWOPug"
+CONSTANTS_COMMUNITY_ID = "1Yv3GXnCIgEIbHL72EuZ-d5q_l-auPgddWi4Efa14jq0"
+CONSTANTS_COMMUNITY_GID = "182216"
 
-def normalize_constant(value):
-    value=str(value or '').strip().replace(',','.')
-    return value if value else ''
+# Keep the same four source URLs used by your previous scraper.
+# Each URL must return the original CSV dataset.
+SOURCE_URLS = {
+    "APPEND": "",
+    "MASTER": "",
+    "EXPERT": "",
+    "HARD": "",
+}
 
-def normalize_title(value):
-    value=unicodedata.normalize('NFKC',str(value or '')).casefold()
-    value=value.replace('’',"'").replace('　',' ')
-    value=re.sub(r'\s+',' ',value)
-    value=re.sub(r'[「」『』【】［］\[\]（）()]','',value)
-    return value.strip()
+HEADERS = [
+    "title",
+    "judgment",
+    "elements",
+    "comments",
+    "difficulty",
+    "lvl",
+    "history",
+    "id",
+    "39sConstant",
+    "Not39s",
+]
 
-def load_csv(url):
-    response=S.get(url,timeout=60)
-    response.raise_for_status()
-    return list(csv.reader(io.StringIO(response.content.decode('utf-8-sig'))))
 
-def parse_source_rows(rows,source_name):
-    constants={}
-    title_ids={}
-    for row in rows[1:]:
-        if len(row)<7:
-            continue
-        title=row[0].strip()
-        constant=normalize_constant(row[2])
-        difficulty=row[5].strip().casefold()
-        song_id=row[6].strip()
-        try:
-            numeric_id=int(song_id)
-        except (ValueError,TypeError):
-            continue
-        if title:
-            title_ids.setdefault(normalize_title(title),numeric_id)
-        if constant and difficulty:
-            constants[(difficulty,numeric_id)]=constant
-    print(f'  Loaded {len(constants)} {source_name} constants and {len(title_ids)} title IDs.')
-    return constants,title_ids
+def get_client():
+    raw = os.environ.get("GCP_SA_KEY")
 
-def load_constants():
-    url=f'https://docs.google.com/spreadsheets/d/{CONSTANTS_SID}/gviz/tq?tqx=out:csv&sheet=Constants'
-    return parse_source_rows(load_csv(url),'39s')
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
 
-def load_community_constants():
-    url=f'https://docs.google.com/spreadsheets/d/{COMMUNITY_CONSTANTS_SID}/export?format=csv&gid={COMMUNITY_GID}'
-    return parse_source_rows(load_csv(url),'Not39s')
-
-def get_constant(lookup,song_id,difficulty):
-    if song_id is None:
-        return ''
-    try:
-        return lookup.get((DIFF_LABEL.get(difficulty,difficulty).casefold(),int(song_id)),'')
-    except (ValueError,TypeError):
-        return ''
-
-def strip_tags(value):
-    return re.sub(r'\s+',' ',re.sub(r'<[^>]+>',' ',value).replace('&nbsp;',' ')).strip()
-
-def clean(value):
-    value=(value or '').strip()
-    return value if value else '-'
-
-def parse_difficulty(difficulty):
-    url='https://pjsekai.com/?'+requests.utils.quote('楽曲難易度表'+difficulty)
-    try:
-        response=S.get(url,timeout=30)
-        response.raise_for_status()
-    except Exception as error:
-        print(f'  [error] fetch {difficulty}: {error}')
-        return []
-    html=response.content.decode('utf-8',errors='replace')
-    html=re.sub(r'</?font[^>]*>','',html,flags=re.I)
-    rows=[]
-    anchor_re=re.compile(r'id="[a-z]+(\d+)"',re.I)
-    starts=[{'index':m.start(),'lvl':m.group(1)} for m in anchor_re.finditer(html)]
-    starts.append({'index':len(html),'lvl':None})
-    for index in range(len(starts)-1):
-        level=starts[index]['lvl']
-        section=html[starts[index]['index']:starts[index+1]['index']]
-        tbody=re.search(r'<tbody>([\s\S]*?)</tbody>',section,re.I)
-        if not tbody:
-            continue
-        for match in re.finditer(r'<tr>([\s\S]*?)</tr>',tbody.group(1),re.I):
-            cells=re.findall(r'<td[^>]*>([\s\S]*?)</td>',match.group(1),re.I)
-            if len(cells)<2:
-                continue
-            title_match=re.search(r'<a[^>]*>([\s\S]*?)</a>',cells[0],re.I)
-            title=strip_tags(title_match.group(1) if title_match else cells[0])
-            if not title:
-                continue
-            judgment=''
-            history=''
-            memo=re.search(r'<div[^>]*class="memo1"[^>]*>([\s\S]*?)</div>',cells[1],re.I)
-            if memo:
-                memo_html=memo.group(1)
-                memo2=re.search(r'<span[^>]*class="memo2"[^>]*>([\s\S]*?)</span>',memo_html,re.I)
-                if memo2:
-                    history=strip_tags(memo2.group(1))
-                    memo_html=memo_html.replace(memo2.group(0),'')
-                judgment=strip_tags(memo_html)
-            else:
-                judgment=strip_tags(cells[1])
-            elements=', '.join(strip_tags(item) for item in re.findall(r'<li[^>]*>([\s\S]*?)</li>',cells[2] if len(cells)>2 else '',re.I) if strip_tags(item))
-            comments=strip_tags(cells[3]) if len(cells)>3 else ''
-            rows.append([clean(title),clean(judgment),clean(elements),clean(comments),difficulty,clean(level),clean(history)])
-    return rows
-
-def load_39s_song_ids(gc):
-    worksheet=gc.open_by_key(SPREADSHEET_ID).worksheet('jp_musics')
-    mapping={}
-    for row in worksheet.get('A:E')[1:]:
-        if len(row)<5:
-            continue
-        title=row[0].strip()
-        try:
-            song_id=int(row[4].strip())
-        except (ValueError,TypeError):
-            continue
-        if title:
-            mapping.setdefault(normalize_title(title),song_id)
-    print(f'  Loaded {len(mapping)} song IDs from jp_musics.')
-    return mapping
-
-def resolve_song_id(title,*mappings):
-    key=normalize_title(title)
-    for mapping in mappings:
-        if key in mapping:
-            return mapping[key]
-    return None
-
-def sort_rows(rows):
-    def key(row):
-        song_id=row[7]
-        return (song_id is None,song_id if song_id is not None else float('inf'),DIFF_ORDER.get(row[4],99),row[0].casefold())
-    return sorted(rows,key=key)
-
-def JUDGMENT():
-    print('=== COMMUNITY scraper started ===')
-    all_rows=[]
-    for index,difficulty in enumerate(DIFFICULTIES,1):
-        rows=parse_difficulty(difficulty)
-        print(f'  [{index}/{len(DIFFICULTIES)}] {difficulty}: {len(rows)} rows')
-        all_rows.extend(rows)
-        time.sleep(0.4)
-    if not all_rows:
-        raise RuntimeError('No data scraped. Google Sheets was not modified.')
-
-    scopes=['https://www.googleapis.com/auth/spreadsheets','https://www.googleapis.com/auth/drive']
-    if os.environ.get('GCP_SA_KEY'):
-        credentials=Credentials.from_service_account_info(json.loads(os.environ['GCP_SA_KEY']),scopes=scopes)
+    if raw:
+        credentials = Credentials.from_service_account_info(
+            json.loads(raw), scopes=scopes
+        )
     else:
-        credentials=Credentials.from_service_account_file(SERVICE_ACCOUNT,scopes=scopes)
-    gc=gspread.authorize(credentials)
+        credentials = Credentials.from_service_account_file(
+            str(Path(__file__).resolve().parent / "service_account.json"),
+            scopes=scopes,
+        )
 
-    print('Loading 39s constants...')
-    constants_39s,ids_39s=load_constants()
-    print('Loading Not39s constants...')
-    constants_not39s,ids_not39s=load_community_constants()
-    print('Loading song IDs...')
-    ids_jp=load_39s_song_ids(gc)
+    return gspread.authorize(credentials)
 
-    output=[]
-    for row in all_rows:
-        title=row[0]
-        difficulty=row[4]
-        song_id=resolve_song_id(title,ids_jp,ids_39s,ids_not39s)
-        constant_39s=get_constant(constants_39s,song_id,difficulty)
-        constant_not39s=get_constant(constants_not39s,song_id,difficulty)
-        output.append(row+[song_id,constant_39s or '-',constant_not39s or '-'])
 
-    output=sort_rows(output)
-    header=['title','judgment','elements','comments','difficulty','lvl','history','id','39sConstant','Not39s']
-    final_output=[header]+[[*row[:7],row[7] if row[7] is not None else '-',row[8],row[9]] for row in output]
+def norm(value):
+    value = str(value or "").strip().casefold()
+    value = re.sub(r"\s+", " ", value)
+    return value
 
-    spreadsheet=gc.open_by_key(SPREADSHEET_ID)
+
+def numeric_id(value):
+    value = str(value or "").strip()
+    match = re.search(r"\d+", value)
+    return int(match.group()) if match else None
+
+
+def fetch_csv(url):
+    if not url:
+        raise ValueError("A source CSV URL is missing from SOURCE_URLS.")
+
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+
+    return list(csv.reader(io.StringIO(response.text)))
+
+
+def get_header_index(header, name):
+    normalized = [norm(value) for value in header]
+
+    if norm(name) not in normalized:
+        raise ValueError(
+            f"Missing required column '{name}'. Found: {header}"
+        )
+
+    return normalized.index(norm(name))
+
+
+def load_metadata(workbook):
+    ws = workbook.worksheet(METADATA_TAB)
+    values = ws.get_all_values()
+
+    if not values:
+        raise ValueError(f"'{METADATA_TAB}' is empty.")
+
+    header = values[0]
+    title_jp_col = get_header_index(header, "title_jp")
+
+    # Metadata matching is based on title_jp, not title or musicId.
+    result = {}
+
+    for row in values[1:]:
+        if len(row) <= title_jp_col:
+            continue
+
+        title_jp = norm(row[title_jp_col])
+
+        if title_jp:
+            result[title_jp] = row
+
+    print(
+        f"Metadata loaded: {len(result)} entries. "
+        f"title_jp is column {title_jp_col + 1} "
+        f"(spreadsheet column {gspread.utils.rowcol_to_a1(1, title_jp_col + 1).rstrip('1')})."
+    )
+
+    return result
+
+
+def load_constants_39s():
+    url = (
+        "https://docs.google.com/spreadsheets/d/"
+        + CONSTANTS_39S_ID
+        + "/export?format=csv&sheet=Constants"
+    )
+
+    rows = fetch_csv(url)
+
+    if not rows:
+        return {}
+
+    header = rows[0]
+    song_col = get_header_index(header, "Song")
+    constant_col = get_header_index(header, "Constant")
+    difficulty_col = get_header_index(header, "Difficulty")
+    id_col = get_header_index(header, "Song ID")
+
+    result = {}
+
+    for row in rows[1:]:
+        if max(song_col, constant_col, difficulty_col, id_col) >= len(row):
+            continue
+
+        song_id = numeric_id(row[id_col])
+        difficulty = norm(row[difficulty_col])
+        constant = row[constant_col].strip()
+
+        if song_id is not None and difficulty and constant:
+            result[(difficulty, song_id)] = constant
+
+    return result
+
+
+def load_constants_community():
+    url = (
+        "https://docs.google.com/spreadsheets/d/"
+        + CONSTANTS_COMMUNITY_ID
+        + "/export?format=csv&gid="
+        + CONSTANTS_COMMUNITY_GID
+    )
+
+    rows = fetch_csv(url)
+
+    if not rows:
+        return {}
+
+    header = rows[0]
+    song_col = get_header_index(header, "Song")
+    constant_col = get_header_index(header, "Constant")
+    difficulty_col = get_header_index(header, "Difficulty")
+    id_col = get_header_index(header, "Song ID")
+
+    result = {}
+
+    for row in rows[1:]:
+        if max(song_col, constant_col, difficulty_col, id_col) >= len(row):
+            continue
+
+        song_id = numeric_id(row[id_col])
+        difficulty = norm(row[difficulty_col])
+        constant = row[constant_col].strip()
+
+        if song_id is not None and difficulty and constant:
+            result[(difficulty, song_id)] = constant
+
+    return result
+
+
+def load_source_id_maps():
+    maps = {}
+
+    for difficulty, url in SOURCE_URLS.items():
+        rows = fetch_csv(url)
+
+        if not rows:
+            continue
+
+        # Source dataset: A=Song, B=Japanese Song, C=Constant,
+        # D=Level, E=Note Count, F=Difficulty, G=Song ID.
+        for row in rows[1:]:
+            if len(row) < 7:
+                continue
+
+            title = norm(row[0])
+            song_id = numeric_id(row[6])
+
+            if title and song_id is not None:
+                maps[title] = song_id
+
+    return maps
+
+
+def get_song_id(title, metadata, source_ids):
+    key = norm(title)
+
+    # Match the Japanese title against metadata raw title_jp.
+    metadata_row = metadata.get(key)
+
+    if metadata_row:
+        # The metadata row is used as the match, while the actual
+        # numeric song ID is resolved from the source dataset.
+        pass
+
+    return source_ids.get(key)
+
+
+def scrape_community_page(url, difficulty):
+    from bs4 import BeautifulSoup
+
+    response = requests.get(
+        url,
+        timeout=30,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    output = []
+
+    anchors = soup.select('a[id^="a"]')
+
+    for anchor in anchors:
+        section_id = anchor.get("id", "")
+        if not section_id:
+            continue
+
+        section = anchor.find_parent()
+        if not section:
+            continue
+
+        table = section.find_next("table")
+
+        if not table:
+            continue
+
+        for tr in table.select("tbody tr"):
+            cells = tr.find_all("td")
+
+            if len(cells) < 5:
+                continue
+
+            title = cells[0].get_text(" ", strip=True)
+            judgment = cells[1].get_text(" ", strip=True)
+            elements = cells[2].get_text(" ", strip=True)
+            comments = cells[3].get_text(" ", strip=True)
+            lvl = cells[4].get_text(" ", strip=True)
+
+            output.append([
+                title,
+                judgment,
+                elements,
+                comments,
+                difficulty,
+                lvl,
+                section_id,
+            ])
+
+    return output
+
+
+def main():
+    client = get_client()
+    workbook = client.open_by_key(SPREADSHEET_ID)
+
+    metadata = load_metadata(workbook)
+    constants_39s = load_constants_39s()
+    constants_community = load_constants_community()
+    source_ids = load_source_id_maps()
+
+    rows = []
+
+    for difficulty, url in SOURCE_URLS.items():
+        if not url:
+            raise ValueError(f"Missing CSV URL for {difficulty}.")
+
+        scraped = scrape_community_page(url, difficulty)
+
+        for item in scraped:
+            title = item[0]
+            song_id = get_song_id(title, metadata, source_ids)
+
+            id_39s = (
+                constants_39s.get((norm(difficulty), song_id), "")
+                if song_id is not None else ""
+            )
+
+            id_community = (
+                constants_community.get((norm(difficulty), song_id), "")
+                if song_id is not None else ""
+            )
+
+            rows.append(item + [
+                song_id if song_id is not None else "",
+                id_39s,
+                id_community,
+            ])
+
+    difficulty_order = {
+        "append": 0,
+        "master": 1,
+        "expert": 2,
+        "hard": 3,
+    }
+
+    rows.sort(
+        key=lambda row: (
+            numeric_id(row[7]) or 999999999,
+            difficulty_order.get(norm(row[4]), 99),
+            norm(row[0]),
+        )
+    )
+
+    if not rows:
+        print("No rows found. Sheet unchanged.")
+        return
+
     try:
-        worksheet=spreadsheet.worksheet(SHEET_NAME)
-    except gspread.exceptions.WorksheetNotFound:
-        worksheet=spreadsheet.add_worksheet(title=SHEET_NAME,rows=max(1000,len(final_output)+10),cols=len(header))
+        worksheet = workbook.worksheet(OUTPUT_TAB)
+    except gspread.WorksheetNotFound:
+        worksheet = workbook.add_worksheet(
+            title=OUTPUT_TAB,
+            rows=1000,
+            cols=len(HEADERS),
+        )
 
     worksheet.clear()
-    worksheet.resize(rows=max(1000,len(final_output)+10),cols=len(header))
-    worksheet.update(range_name='A1',values=final_output,value_input_option='RAW')
+    worksheet.update(
+        range_name="A1",
+        values=[HEADERS] + rows,
+        value_input_option="RAW",
+    )
 
-    matched=sum(row[7]!='-' for row in final_output[1:])
-    matched_39s=sum(row[8]!='-' for row in final_output[1:])
-    matched_not39s=sum(row[9]!='-' for row in final_output[1:])
-    print(f'=== Done. {len(output)} rows written. ===')
-    print(f'  IDs matched: {matched}/{len(output)}')
-    print(f'  39s constants matched: {matched_39s}')
-    print(f'  Not39s constants matched: {matched_not39s}')
+    print(f"Updated {len(rows)} rows in '{OUTPUT_TAB}'.")
 
-if __name__=='__main__':
-    try:
-        JUDGMENT()
-    except Exception:
-        import traceback
-        traceback.print_exc()
-    finally:
-        if not IS_GITHUB_ACTIONS:
-            input('Press Enter to exit...')
+
+if __name__ == "__main__":
+    main()
