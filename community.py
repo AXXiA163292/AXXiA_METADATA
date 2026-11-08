@@ -1,3 +1,4 @@
+
 import os
 import re
 import csv
@@ -50,14 +51,6 @@ HEADERS = [
     "Not39s",
 ]
 
-SONG_ID_HEADERS = [
-    "id",
-    "song_id",
-    "song id",
-    "music_id",
-    "music id",
-    "musicid",
-]
 
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
@@ -168,46 +161,31 @@ def load_metadata(workbook):
 
     header = values[0]
 
+    # Only use title_jp and id.
     title_col = get_header_index(header, "title_jp")
-
-    id_col = None
-    for candidate in SONG_ID_HEADERS:
-        try:
-            id_col = get_header_index(header, candidate)
-            break
-        except ValueError:
-            continue
+    id_col = get_header_index(header, "id")
 
     title_to_id = {}
-    metadata_titles = set()
+    id_to_title = {}
 
     for row in values[1:]:
-        if len(row) <= title_col:
+        if len(row) <= max(title_col, id_col):
             continue
 
         title = normalize_title(row[title_col])
+        song_id = numeric_id(row[id_col])
 
-        if not title:
+        if not title or song_id is None:
             continue
 
-        metadata_titles.add(title)
+        title_to_id[title] = song_id
+        id_to_title[song_id] = row[title_col].strip()
 
-        if id_col is not None and len(row) > id_col:
-            song_id = numeric_id(row[id_col])
+    print(f"Loaded {len(title_to_id)} Japanese title-to-ID mappings.")
+    print(f"Loaded {len(id_to_title)} metadata IDs.")
+    print("Metadata matching columns: title_jp + id.")
 
-            if song_id is not None:
-                title_to_id[title] = song_id
-
-    column_letter = gspread.utils.rowcol_to_a1(
-        1,
-        title_col + 1,
-    ).rstrip("1")
-
-    print(f"Loaded {len(metadata_titles)} metadata titles.")
-    print(f"title_jp is column {column_letter}.")
-    print(f"Metadata IDs: {len(title_to_id)}.")
-
-    return metadata_titles, title_to_id
+    return title_to_id, id_to_title
 
 
 def load_constants_table(client, spreadsheet_id, worksheet_name):
@@ -226,20 +204,23 @@ def load_constants_table(client, spreadsheet_id, worksheet_name):
 
     header = values[header_index]
 
-    title_col = get_header_index(
-        header,
-        ["Song", "Song JP", "Japanese Song", "title_jp"],
-    )
-
     constant_col = get_header_index(header, "Constant")
     difficulty_col = get_header_index(header, "Difficulty")
     id_col = get_header_index(header, "Song ID")
+
+    # Title is optional and is never used for 39s matching.
+    try:
+        title_col = get_header_index(
+            header,
+            ["Song", "Song JP", "Japanese Song", "title_jp"],
+        )
+    except ValueError:
+        title_col = None
 
     records = []
 
     for row in values[header_index + 1:]:
         required = max(
-            title_col,
             constant_col,
             difficulty_col,
             id_col,
@@ -248,17 +229,21 @@ def load_constants_table(client, spreadsheet_id, worksheet_name):
         if len(row) <= required:
             continue
 
-        title = str(row[title_col]).strip()
+        title = (
+            str(row[title_col]).strip()
+            if title_col is not None and len(row) > title_col
+            else ""
+        )
+
         constant = str(row[constant_col]).strip()
         difficulty = normalize_difficulty(row[difficulty_col])
         song_id = numeric_id(row[id_col])
 
-        if not title or not difficulty or song_id is None:
+        if not difficulty or song_id is None:
             continue
 
         records.append({
             "title": title,
-            "title_key": normalize_title(title),
             "constant": constant,
             "difficulty": difficulty,
             "id": song_id,
@@ -272,28 +257,48 @@ def load_constants_table(client, spreadsheet_id, worksheet_name):
     return records
 
 
-def build_constant_lookups(records):
-    title_to_id = {}
+def build_constant_lookups(records, metadata_id_to_title):
     constants_by_title = {}
     ids = set()
+    unmatched_ids = set()
 
     for record in records:
-        title_key = record["title_key"]
         song_id = record["id"]
         difficulty = record["difficulty"]
         constant = record["constant"]
 
         ids.add(song_id)
 
-        if title_key:
-            title_to_id.setdefault(title_key, song_id)
+        # Resolve the Japanese title exclusively through METADATA_RAW.
+        jp_title = metadata_id_to_title.get(song_id)
+
+        if not jp_title:
+            unmatched_ids.add(song_id)
+            continue
+
+        title_key = normalize_title(jp_title)
 
         if title_key and constant:
             constants_by_title[
                 (title_key, difficulty)
             ] = constant
 
-    return title_to_id, constants_by_title, ids
+    print(
+        f"39s constants linked through metadata IDs: "
+        f"{len(constants_by_title)}."
+    )
+
+    if unmatched_ids:
+        print(
+            f"39s IDs missing from METADATA_RAW: "
+            f"{len(unmatched_ids)}."
+        )
+        print(
+            "First unmatched IDs: "
+            + ", ".join(map(str, sorted(unmatched_ids)[:20]))
+        )
+
+    return constants_by_title, ids
 
 
 def build_override_lookup(records):
@@ -334,7 +339,6 @@ def parse_difficulty(difficulty):
 
     rows = []
 
-    # Each anchor represents a difficulty-level section.
     anchor_pattern = re.compile(
         r'id=["\'][a-z]+(\d+)["\']',
         re.I,
@@ -462,7 +466,6 @@ def parse_difficulty(difficulty):
                 history,
             ])
 
-    # Remove duplicate entries without losing their original order.
     unique_rows = []
     seen = set()
 
@@ -536,8 +539,10 @@ def main():
     client = get_client()
     workbook = client.open_by_key(SPREADSHEET_ID)
 
-    # 3. Load metadata and both constants worksheets.
-    metadata_titles, metadata_ids = load_metadata(workbook)
+    # 3. Load metadata and constants.
+    metadata_title_to_id, metadata_id_to_title = load_metadata(
+        workbook
+    )
 
     constants_39s_records = load_constants_table(
         client,
@@ -552,27 +557,20 @@ def main():
     )
 
     # 4. Build lookup tables.
-    constants_title_ids, constants_by_title, constants_ids = (
-        build_constant_lookups(constants_39s_records)
+    # 39s matching uses Song ID -> METADATA_RAW title_jp.
+    constants_by_title, constants_ids = build_constant_lookups(
+        constants_39s_records,
+        metadata_id_to_title,
     )
 
-    override_title_ids, _, _ = build_constant_lookups(
-        override_records
-    )
-
+    # Overrides continue to use metadata ID + difficulty.
     override_lookup = build_override_lookup(
         override_records
     )
 
-    # Metadata has priority for the ID.
-    # Constants and overrides provide fallback IDs.
-    title_to_id = dict(constants_title_ids)
-    title_to_id.update(override_title_ids)
-    title_to_id.update(metadata_ids)
-
     print(
-        f"Total Japanese title-to-ID mappings: "
-        f"{len(title_to_id)}."
+        f"Metadata title-to-ID mappings: "
+        f"{len(metadata_title_to_id)}."
     )
 
     print(
@@ -585,10 +583,9 @@ def main():
         f"{len(override_records)}."
     )
 
-    # 5. Match scraped rows using Japanese titles.
+    # 5. Match scraped rows using title_jp.
     output_rows = []
     represented_override_keys = set()
-
     unmatched_titles = set()
 
     for item in scraped_rows:
@@ -596,37 +593,27 @@ def main():
         title_key = normalize_title(title)
         difficulty = normalize_difficulty(item[4])
 
-        song_id = title_to_id.get(title_key)
+        # Forum title is matched directly against METADATA_RAW title_jp.
+        song_id = metadata_title_to_id.get(title_key)
 
         if song_id is None:
             unmatched_titles.add(title)
 
-        # 39s constants are matched by Japanese title + difficulty.
+        # 39s constant is matched through metadata ID -> title_jp.
         constant_39s = constants_by_title.get(
             (title_key, difficulty),
             "",
         )
 
-        # The override is matched using the resolved song ID.
         constant_override = ""
 
         if song_id is not None:
             override_key = (song_id, difficulty)
-            override_record = override_lookup.get(
-                override_key
-            )
+            override_record = override_lookup.get(override_key)
 
             if override_record:
                 represented_override_keys.add(override_key)
-
-                # Existing 39s song IDs receive the override
-                # in the additional column only.
-                if song_id in constants_ids:
-                    constant_override = override_record["constant"]
-
-                # IDs absent from 39s are handled separately below.
-                else:
-                    constant_override = override_record["constant"]
+                constant_override = override_record["constant"]
 
         output_rows.append(
             item + [
@@ -636,12 +623,10 @@ def main():
             ]
         )
 
-    # 6. Sort the scraped rows by ID and difficulty.
+    # 6. Sort scraped rows.
     output_rows = sort_rows(output_rows)
 
     # 7. Add override-only entries that are not in 39s Constants.
-    # If an override already corresponds to a scraped row,
-    # keep that row instead of creating a duplicate.
     appended_rows = []
 
     existing_keys = {
@@ -665,8 +650,13 @@ def main():
         if key in existing_keys:
             continue
 
-        appended_rows.append([
+        jp_title = metadata_id_to_title.get(
+            song_id,
             record["title"],
+        )
+
+        appended_rows.append([
+            jp_title,
             "",
             "",
             "",
@@ -680,7 +670,6 @@ def main():
 
         existing_keys.add(key)
 
-    # Keep override-only entries at the bottom.
     appended_rows = sort_rows(appended_rows)
 
     final_rows = output_rows + appended_rows
@@ -691,7 +680,7 @@ def main():
 
     if unmatched_titles:
         print(
-            "First unmatched titles: "
+            "First unmatched community titles: "
             + ", ".join(sorted(unmatched_titles)[:20])
         )
 
