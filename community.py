@@ -15,10 +15,11 @@ OUTPUT_TAB = "community"
 METADATA_TAB = "METADATA_RAW"
 
 CONSTANTS_39S_ID = "1B8tX9VL2PcSJKyuHFVd2UT_8kYlY4ZdwHwg9MfWOPug"
-CONSTANTS_COMMUNITY_ID = "1Yv3GXnCIgEIbHL72EuZ-d5q_l-auPgddWi4Efa14jq0"
-CONSTANTS_COMMUNITY_GID = "182216"
+CONSTANTS_39S_TAB = "Constants"
 
-# Keep your original four CSV URLs here.
+CONSTANTS_COMMUNITY_ID = "1Yv3GXnCIgEIbHL72EuZ-d5q_l-auPgddWi4Efa14jq0"
+CONSTANTS_COMMUNITY_TAB = "Constant Overrides"
+
 SOURCE_URLS = {
     "APPEND": "",
     "MASTER": "",
@@ -116,24 +117,33 @@ def load_metadata(workbook):
     return result
 
 
-def load_constants(spreadsheet_id, sheet_name=None, gid=None):
-    if sheet_name:
-        url = (
-            f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
-            f"/export?format=csv&sheet={sheet_name}"
+def load_constants(client, spreadsheet_id, sheet_name):
+    try:
+        constants_workbook = client.open_by_key(spreadsheet_id)
+        ws = constants_workbook.worksheet(sheet_name)
+    except gspread.SpreadsheetNotFound:
+        raise ValueError(
+            f"Cannot access constants spreadsheet: {spreadsheet_id}"
         )
-    else:
-        url = (
-            f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
-            f"/export?format=csv&gid={gid}"
+    except gspread.WorksheetNotFound:
+        available = [
+            sheet.title
+            for sheet in constants_workbook.worksheets()
+        ]
+        raise ValueError(
+            f"Worksheet '{sheet_name}' not found in {spreadsheet_id}. "
+            f"Available worksheets: {available}"
         )
 
-    rows = fetch_csv(url)
+    rows = ws.get_all_values()
 
     if not rows:
-        return {}
+        raise ValueError(
+            f"Worksheet '{sheet_name}' in {spreadsheet_id} is empty."
+        )
 
     header = rows[0]
+
     constant_col = get_header_index(header, "Constant")
     difficulty_col = get_header_index(header, "Difficulty")
     id_col = get_header_index(header, "Song ID")
@@ -150,6 +160,11 @@ def load_constants(spreadsheet_id, sheet_name=None, gid=None):
 
         if song_id is not None and difficulty and constant:
             result[(difficulty, song_id)] = constant
+
+    print(
+        f"Loaded {len(result)} constants from "
+        f"'{sheet_name}'."
+    )
 
     return result
 
@@ -244,13 +259,15 @@ def main():
     metadata = load_metadata(workbook)
 
     constants_39s = load_constants(
+        client,
         CONSTANTS_39S_ID,
-        sheet_name="Constants",
+        CONSTANTS_39S_TAB,
     )
 
     constants_community = load_constants(
+        client,
         CONSTANTS_COMMUNITY_ID,
-        gid=CONSTANTS_COMMUNITY_GID,
+        CONSTANTS_COMMUNITY_TAB,
     )
 
     source_ids = load_source_id_maps()
