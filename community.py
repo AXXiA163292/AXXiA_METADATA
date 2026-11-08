@@ -1,18 +1,19 @@
 import os
 import re
 import csv
-import json
 import io
+import json
+import html
+import time
+import unicodedata
 import requests
 import gspread
 
 from pathlib import Path
-from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 
 
 SPREADSHEET_ID = "1Fpp_sJbGjuKxUAcWhZOM1YqHJJrUHTWE56lO4dthhak"
-
 OUTPUT_TAB = "community"
 METADATA_TAB = "METADATA_RAW"
 
@@ -22,8 +23,6 @@ CONSTANTS_39S_TAB = "Constants"
 CONSTANTS_COMMUNITY_ID = "1Yv3GXnCIgEIbHL72EuZ-d5q_l-auPgddWi4Efa14jq0"
 CONSTANTS_COMMUNITY_TAB = "Constant Overrides"
 
-
-# Actual community difficulty-table pages.
 FORUM_URLS = {
     "APPEND": "https://pjsekai.com/?%E6%A5%BD%E6%9B%B2%E9%9B%A3%E6%98%93%E5%BA%A6%E8%A1%A8APPEND",
     "MASTER": "https://pjsekai.com/?%E6%A5%BD%E6%9B%B2%E9%9B%A3%E6%98%93%E5%BA%A6%E8%A1%A8MASTER",
@@ -31,17 +30,12 @@ FORUM_URLS = {
     "HARD": "https://pjsekai.com/?%E6%A5%BD%E6%9B%B2%E9%9B%A3%E6%98%93%E5%BA%A6%E8%A1%A8HARD",
 }
 
-
-# Optional ID mapping CSVs.
-# Leave blank if METADATA_RAW already contains a song ID column.
-# These must be CSV URLs, not the four forum URLs above.
-SOURCE_CSV_URLS = {
-    "APPEND": "",
-    "MASTER": "",
-    "EXPERT": "",
-    "HARD": "",
+DIFFICULTY_ORDER = {
+    "append": 0,
+    "master": 1,
+    "expert": 2,
+    "hard": 3,
 }
-
 
 HEADERS = [
     "title",
@@ -56,7 +50,6 @@ HEADERS = [
     "Not39s",
 ]
 
-
 SONG_ID_HEADERS = [
     "id",
     "song_id",
@@ -64,9 +57,7 @@ SONG_ID_HEADERS = [
     "music_id",
     "music id",
     "musicid",
-    "musicid",
 ]
-
 
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
@@ -74,12 +65,12 @@ REQUEST_HEADERS = {
 
 
 def get_client():
-    raw = os.environ.get("GCP_SA_KEY")
-
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
+
+    raw = os.environ.get("GCP_SA_KEY")
 
     if raw:
         credentials = Credentials.from_service_account_info(
@@ -95,9 +86,16 @@ def get_client():
     return gspread.authorize(credentials)
 
 
+def normalize_title(value):
+    value = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    value = value.replace("’", "'").replace("　", " ")
+    value = re.sub(r"\s+", " ", value)
+    value = re.sub(r'[「」『』【】［］\[\]（）()]', "", value)
+    return value.strip()
+
+
 def norm(value):
-    value = str(value or "").strip().casefold()
-    return re.sub(r"\s+", " ", value)
+    return str(value or "").strip().casefold()
 
 
 def numeric_id(value):
@@ -105,236 +103,216 @@ def numeric_id(value):
     return int(match.group()) if match else None
 
 
-def fetch_csv(url):
-    if not url:
-        raise ValueError("A source CSV URL is missing.")
+def normalize_difficulty(value):
+    value = norm(value)
 
-    response = requests.get(
-        url,
-        timeout=30,
-        headers=REQUEST_HEADERS,
-    )
-    response.raise_for_status()
+    aliases = {
+        "append": "append",
+        "master": "master",
+        "expert": "expert",
+        "hard": "hard",
+    }
 
-    return list(
-        csv.reader(
-            io.StringIO(response.content.decode("utf-8-sig"))
-        )
-    )
+    return aliases.get(value, value)
 
 
-def get_header_index(header, name):
+def clean(value):
+    value = html.unescape(str(value or ""))
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def strip_tags(value):
+    return clean(re.sub(r"<[^>]+>", " ", value))
+
+
+def get_header_index(header, candidates):
+    if isinstance(candidates, str):
+        candidates = [candidates]
+
     normalized = [norm(value) for value in header]
 
-    if norm(name) not in normalized:
-        raise ValueError(
-            f"Missing column '{name}'. Available columns: {header}"
-        )
+    for candidate in candidates:
+        candidate = norm(candidate)
 
-    return normalized.index(norm(name))
+        if candidate in normalized:
+            return normalized.index(candidate)
+
+    raise ValueError(
+        f"Missing column. Expected one of {candidates}. "
+        f"Available columns: {header}"
+    )
 
 
 def find_header_row(values, required_headers):
     required = {norm(value) for value in required_headers}
 
     for index, row in enumerate(values):
-        normalized = {norm(value) for value in row}
+        available = {norm(value) for value in row}
 
-        if required.issubset(normalized):
+        if required.issubset(available):
             return index
 
     raise ValueError(
-        "Could not find a header row containing: "
-        + ", ".join(required_headers)
-        + ". First rows received: "
-        + repr(values[:5])
+        f"Could not find header row containing {required_headers}. "
+        f"First rows: {values[:5]}"
     )
 
 
-def find_optional_id_column(header):
-    normalized = [norm(value) for value in header]
-
-    for candidate in SONG_ID_HEADERS:
-        if norm(candidate) in normalized:
-            return normalized.index(norm(candidate))
-
-    return None
-
-
 def load_metadata(workbook):
-    ws = workbook.worksheet(METADATA_TAB)
-    values = ws.get_all_values()
+    worksheet = workbook.worksheet(METADATA_TAB)
+    values = worksheet.get_all_values()
 
     if not values:
-        raise ValueError(f"'{METADATA_TAB}' is empty.")
+        raise ValueError(f"{METADATA_TAB} is empty.")
 
     header = values[0]
 
-    title_jp_col = get_header_index(header, "title_jp")
-    id_col = find_optional_id_column(header)
+    title_col = get_header_index(header, "title_jp")
 
-    metadata = {}
-    metadata_ids = {}
+    id_col = None
+    for candidate in SONG_ID_HEADERS:
+        try:
+            id_col = get_header_index(header, candidate)
+            break
+        except ValueError:
+            continue
+
+    title_to_id = {}
+    metadata_titles = set()
 
     for row in values[1:]:
-        if len(row) <= title_jp_col:
+        if len(row) <= title_col:
             continue
 
-        title_jp = norm(row[title_jp_col])
+        title = normalize_title(row[title_col])
 
-        if not title_jp:
+        if not title:
             continue
 
-        metadata[title_jp] = row
+        metadata_titles.add(title)
 
         if id_col is not None and len(row) > id_col:
             song_id = numeric_id(row[id_col])
 
             if song_id is not None:
-                metadata_ids[title_jp] = song_id
+                title_to_id[title] = song_id
 
     column_letter = gspread.utils.rowcol_to_a1(
         1,
-        title_jp_col + 1,
+        title_col + 1,
     ).rstrip("1")
 
-    print(
-        f"Loaded {len(metadata)} metadata titles. "
-        f"title_jp is column {column_letter}."
-    )
+    print(f"Loaded {len(metadata_titles)} metadata titles.")
+    print(f"title_jp is column {column_letter}.")
+    print(f"Metadata IDs: {len(title_to_id)}.")
 
-    if id_col is not None:
-        print(
-            f"Found song IDs directly in METADATA_RAW: "
-            f"{len(metadata_ids)}."
-        )
-    else:
-        print("No song ID column found in METADATA_RAW.")
-
-    return metadata, metadata_ids
+    return metadata_titles, title_to_id
 
 
-def load_constants(client, spreadsheet_id, worksheet_name):
+def load_constants_table(client, spreadsheet_id, worksheet_name):
     spreadsheet = client.open_by_key(spreadsheet_id)
-
-    try:
-        ws = spreadsheet.worksheet(worksheet_name)
-    except gspread.WorksheetNotFound:
-        available = [
-            worksheet.title
-            for worksheet in spreadsheet.worksheets()
-        ]
-
-        raise ValueError(
-            f"Worksheet '{worksheet_name}' not found in "
-            f"{spreadsheet_id}. Available worksheets: {available}"
-        )
-
-    values = ws.get_all_values()
+    worksheet = spreadsheet.worksheet(worksheet_name)
+    values = worksheet.get_all_values()
 
     if not values:
-        print(f"Warning: '{worksheet_name}' is empty.")
-        return {}
+        print(f"Warning: {worksheet_name} is empty.")
+        return []
 
-    header_row_index = find_header_row(
+    header_index = find_header_row(
         values,
         ["Constant", "Difficulty", "Song ID"],
     )
 
-    header = values[header_row_index]
+    header = values[header_index]
+
+    title_col = get_header_index(
+        header,
+        ["Song", "Song JP", "Japanese Song", "title_jp"],
+    )
 
     constant_col = get_header_index(header, "Constant")
     difficulty_col = get_header_index(header, "Difficulty")
     id_col = get_header_index(header, "Song ID")
 
-    result = {}
+    records = []
 
-    for row in values[header_row_index + 1:]:
-        required_col = max(
+    for row in values[header_index + 1:]:
+        required = max(
+            title_col,
             constant_col,
             difficulty_col,
             id_col,
         )
 
-        if len(row) <= required_col:
+        if len(row) <= required:
             continue
 
-        song_id = numeric_id(row[id_col])
-        difficulty = norm(row[difficulty_col])
+        title = str(row[title_col]).strip()
         constant = str(row[constant_col]).strip()
+        difficulty = normalize_difficulty(row[difficulty_col])
+        song_id = numeric_id(row[id_col])
 
-        if song_id is None or not difficulty or not constant:
+        if not title or not difficulty or song_id is None:
             continue
 
-        result[(difficulty, song_id)] = constant
+        records.append({
+            "title": title,
+            "title_key": normalize_title(title),
+            "constant": constant,
+            "difficulty": difficulty,
+            "id": song_id,
+        })
 
     print(
-        f"Loaded {len(result)} constants from "
+        f"Loaded {len(records)} records from "
         f"'{worksheet_name}'."
     )
 
-    return result
+    return records
 
 
-def load_source_id_maps(metadata_ids):
-    title_to_id = dict(metadata_ids)
+def build_constant_lookups(records):
+    title_to_id = {}
+    constants_by_title = {}
+    ids = set()
 
-    for difficulty, url in SOURCE_CSV_URLS.items():
-        if not url:
-            continue
+    for record in records:
+        title_key = record["title_key"]
+        song_id = record["id"]
+        difficulty = record["difficulty"]
+        constant = record["constant"]
 
-        rows = fetch_csv(url)
+        ids.add(song_id)
 
-        # Source CSV columns:
-        # A = Song
-        # B = Japanese Song
-        # C = Constant
-        # D = Level
-        # E = Note Count
-        # F = Difficulty
-        # G = Song ID
+        if title_key:
+            title_to_id.setdefault(title_key, song_id)
 
-        for row in rows[1:]:
-            if len(row) < 7:
-                continue
+        if title_key and constant:
+            constants_by_title[
+                (title_key, difficulty)
+            ] = constant
 
-            english_title = norm(row[0])
-            japanese_title = norm(row[1])
-            song_id = numeric_id(row[6])
+    return title_to_id, constants_by_title, ids
 
-            if song_id is None:
-                continue
 
-            if english_title:
-                title_to_id[english_title] = song_id
+def build_override_lookup(records):
+    overrides = {}
 
-            if japanese_title:
-                title_to_id[japanese_title] = song_id
-
-        print(f"Loaded ID mappings from {difficulty} CSV.")
-
-    print(f"Total title-to-ID mappings: {len(title_to_id)}")
-
-    if not title_to_id:
-        raise ValueError(
-            "No song IDs were found. Add a song ID column to "
-            "METADATA_RAW or provide the four SOURCE_CSV_URLS."
+    for record in records:
+        key = (
+            record["id"],
+            record["difficulty"],
         )
 
-    return title_to_id
+        overrides[key] = record
+
+    return overrides
 
 
-def get_song_id(title, metadata, source_ids):
-    key = norm(title)
+def parse_difficulty(difficulty):
+    url = FORUM_URLS[difficulty]
 
-    # Only accept titles present in METADATA_RAW.
-    if key not in metadata:
-        return None
-
-    return source_ids.get(key)
-
-
-def scrape_community_page(url, difficulty):
     response = requests.get(
         url,
         timeout=45,
@@ -342,188 +320,430 @@ def scrape_community_page(url, difficulty):
     )
     response.raise_for_status()
 
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    # Prefer the main page content to avoid unrelated tables.
-    content = (
-        soup.select_one("#body")
-        or soup.select_one("#contents")
-        or soup.select_one("#content")
-        or soup
+    source = response.content.decode(
+        "utf-8",
+        errors="replace",
     )
 
-    output = []
-    seen = set()
+    source = re.sub(
+        r"</?font[^>]*>",
+        "",
+        source,
+        flags=re.I,
+    )
 
-    for table in content.find_all("table"):
-        for tr in table.find_all("tr"):
-            cells = tr.find_all(
-                ["td", "th"],
-                recursive=False,
+    rows = []
+
+    # Each anchor represents a difficulty-level section.
+    anchor_pattern = re.compile(
+        r'id=["\'][a-z]+(\d+)["\']',
+        re.I,
+    )
+
+    sections = [
+        {
+            "position": match.start(),
+            "level": match.group(1),
+        }
+        for match in anchor_pattern.finditer(source)
+    ]
+
+    sections.append({
+        "position": len(source),
+        "level": None,
+    })
+
+    for index in range(len(sections) - 1):
+        level = sections[index]["level"]
+
+        section = source[
+            sections[index]["position"]:
+            sections[index + 1]["position"]
+        ]
+
+        tbody_match = re.search(
+            r"<tbody[^>]*>([\s\S]*?)</tbody>",
+            section,
+            re.I,
+        )
+
+        if not tbody_match:
+            continue
+
+        tbody = tbody_match.group(1)
+
+        for row_match in re.finditer(
+            r"<tr[^>]*>([\s\S]*?)</tr>",
+            tbody,
+            re.I,
+        ):
+            cells = re.findall(
+                r"<td[^>]*>([\s\S]*?)</td>",
+                row_match.group(1),
+                re.I,
             )
 
-            # The difficulty tables contain five data columns.
-            if len(cells) < 5:
+            if len(cells) < 2:
                 continue
 
-            if any(cell.name == "th" for cell in cells):
-                continue
-
-            values = [
-                cell.get_text(" ", strip=True)
-                for cell in cells[:5]
-            ]
-
-            if not values[0]:
-                continue
-
-            # Ignore repeated rows.
-            row_key = tuple(values)
-
-            if row_key in seen:
-                continue
-
-            seen.add(row_key)
-
-            # Find the nearest preceding section anchor.
-            previous_anchors = table.find_all_previous(
-                "a",
-                id=re.compile(r"^a"),
+            title_match = re.search(
+                r"<a[^>]*>([\s\S]*?)</a>",
+                cells[0],
+                re.I,
             )
 
-            section_id = (
-                previous_anchors[0].get("id", "")
-                if previous_anchors
+            title = strip_tags(
+                title_match.group(1)
+                if title_match
+                else cells[0]
+            )
+
+            if not title:
+                continue
+
+            judgment = ""
+            history = ""
+
+            memo_match = re.search(
+                r'<div[^>]*class=["\'][^"\']*memo1[^"\']*["\'][^>]*>([\s\S]*?)</div>',
+                cells[1],
+                re.I,
+            )
+
+            if memo_match:
+                memo_html = memo_match.group(1)
+
+                history_match = re.search(
+                    r'<span[^>]*class=["\'][^"\']*memo2[^"\']*["\'][^>]*>([\s\S]*?)</span>',
+                    memo_html,
+                    re.I,
+                )
+
+                if history_match:
+                    history = strip_tags(history_match.group(1))
+                    memo_html = memo_html.replace(
+                        history_match.group(0),
+                        "",
+                    )
+
+                judgment = strip_tags(memo_html)
+
+            else:
+                judgment = strip_tags(cells[1])
+
+            elements = ""
+
+            if len(cells) > 2:
+                element_items = re.findall(
+                    r"<li[^>]*>([\s\S]*?)</li>",
+                    cells[2],
+                    re.I,
+                )
+
+                elements = ", ".join(
+                    strip_tags(item)
+                    for item in element_items
+                    if strip_tags(item)
+                )
+
+            comments = (
+                strip_tags(cells[3])
+                if len(cells) > 3
                 else ""
             )
 
-            output.append([
-                values[0],       # title
-                values[1],       # judgment
-                values[2],       # elements
-                values[3],       # comments
+            rows.append([
+                title,
+                judgment,
+                elements,
+                comments,
                 difficulty,
-                values[4],       # lvl
-                section_id,
+                str(level or ""),
+                history,
             ])
 
+    # Remove duplicate entries without losing their original order.
+    unique_rows = []
+    seen = set()
+
+    for row in rows:
+        key = (
+            normalize_title(row[0]),
+            row[4],
+            row[5],
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique_rows.append(row)
+
     print(
-        f"{difficulty}: scraped {len(output)} rows "
-        f"from {url}"
+        f"{difficulty}: scraped {len(unique_rows)} rows."
     )
 
-    if not output:
-        raise ValueError(
-            f"No difficulty rows found on the {difficulty} page. "
+    if not unique_rows:
+        raise RuntimeError(
+            f"No rows scraped for {difficulty}. "
             "The page structure may have changed."
         )
 
-    return output
+    return unique_rows
+
+
+def sort_rows(rows):
+    return sorted(
+        rows,
+        key=lambda row: (
+            row[7] == "",
+            numeric_id(row[7]) or 999999999,
+            DIFFICULTY_ORDER.get(
+                normalize_difficulty(row[4]),
+                99,
+            ),
+            normalize_title(row[0]),
+        ),
+    )
 
 
 def main():
+    print("=== COMMUNITY scraper started ===")
+
+    # 1. Scrape the four community pages.
+    scraped_rows = []
+
+    for index, difficulty in enumerate(
+        FORUM_URLS,
+        start=1,
+    ):
+        rows = parse_difficulty(difficulty)
+        scraped_rows.extend(rows)
+
+        print(
+            f"[{index}/4] {difficulty}: "
+            f"{len(rows)} rows."
+        )
+
+        time.sleep(0.4)
+
+    if not scraped_rows:
+        raise RuntimeError(
+            "No community rows found. Google Sheets was not modified."
+        )
+
+    # 2. Connect to Google Sheets.
     client = get_client()
     workbook = client.open_by_key(SPREADSHEET_ID)
 
-    metadata, metadata_ids = load_metadata(workbook)
+    # 3. Load metadata and both constants worksheets.
+    metadata_titles, metadata_ids = load_metadata(workbook)
 
-    constants_39s = load_constants(
+    constants_39s_records = load_constants_table(
         client,
         CONSTANTS_39S_ID,
         CONSTANTS_39S_TAB,
     )
 
-    constants_community = load_constants(
+    override_records = load_constants_table(
         client,
         CONSTANTS_COMMUNITY_ID,
         CONSTANTS_COMMUNITY_TAB,
     )
 
-    source_ids = load_source_id_maps(metadata_ids)
-
-    rows = []
-
-    for difficulty, url in FORUM_URLS.items():
-        scraped = scrape_community_page(
-            url,
-            difficulty,
-        )
-
-        for item in scraped:
-            title = item[0]
-
-            song_id = get_song_id(
-                title,
-                metadata,
-                source_ids,
-            )
-
-            constant_39s = (
-                constants_39s.get(
-                    (norm(difficulty), song_id),
-                    "",
-                )
-                if song_id is not None
-                else ""
-            )
-
-            constant_community = (
-                constants_community.get(
-                    (norm(difficulty), song_id),
-                    "",
-                )
-                if song_id is not None
-                else ""
-            )
-
-            rows.append(
-                item + [
-                    song_id if song_id is not None else "",
-                    constant_39s,
-                    constant_community,
-                ]
-            )
-
-    difficulty_order = {
-        "append": 0,
-        "master": 1,
-        "expert": 2,
-        "hard": 3,
-    }
-
-    rows.sort(
-        key=lambda row: (
-            numeric_id(row[7]) or 999999999,
-            difficulty_order.get(norm(row[4]), 99),
-            norm(row[0]),
-        )
+    # 4. Build lookup tables.
+    constants_title_ids, constants_by_title, constants_ids = (
+        build_constant_lookups(constants_39s_records)
     )
 
-    if not rows:
-        print("No rows found. Sheet unchanged.")
-        return
+    override_title_ids, _, _ = build_constant_lookups(
+        override_records
+    )
 
+    override_lookup = build_override_lookup(
+        override_records
+    )
+
+    # Metadata has priority for the ID.
+    # Constants and overrides provide fallback IDs.
+    title_to_id = dict(constants_title_ids)
+    title_to_id.update(override_title_ids)
+    title_to_id.update(metadata_ids)
+
+    print(
+        f"Total Japanese title-to-ID mappings: "
+        f"{len(title_to_id)}."
+    )
+
+    print(
+        f"IDs present in 39s Constants: "
+        f"{len(constants_ids)}."
+    )
+
+    print(
+        f"Community override records: "
+        f"{len(override_records)}."
+    )
+
+    # 5. Match scraped rows using Japanese titles.
+    output_rows = []
+    represented_override_keys = set()
+
+    unmatched_titles = set()
+
+    for item in scraped_rows:
+        title = item[0]
+        title_key = normalize_title(title)
+        difficulty = normalize_difficulty(item[4])
+
+        song_id = title_to_id.get(title_key)
+
+        if song_id is None:
+            unmatched_titles.add(title)
+
+        # 39s constants are matched by Japanese title + difficulty.
+        constant_39s = constants_by_title.get(
+            (title_key, difficulty),
+            "",
+        )
+
+        # The override is matched using the resolved song ID.
+        constant_override = ""
+
+        if song_id is not None:
+            override_key = (song_id, difficulty)
+            override_record = override_lookup.get(
+                override_key
+            )
+
+            if override_record:
+                represented_override_keys.add(override_key)
+
+                # Existing 39s song IDs receive the override
+                # in the additional column only.
+                if song_id in constants_ids:
+                    constant_override = override_record["constant"]
+
+                # IDs absent from 39s are handled separately below.
+                else:
+                    constant_override = override_record["constant"]
+
+        output_rows.append(
+            item + [
+                str(song_id) if song_id is not None else "",
+                constant_39s,
+                constant_override,
+            ]
+        )
+
+    # 6. Sort the scraped rows by ID and difficulty.
+    output_rows = sort_rows(output_rows)
+
+    # 7. Add override-only entries that are not in 39s Constants.
+    # If an override already corresponds to a scraped row,
+    # keep that row instead of creating a duplicate.
+    appended_rows = []
+
+    existing_keys = {
+        (
+            numeric_id(row[7]),
+            normalize_difficulty(row[4]),
+        )
+        for row in output_rows
+        if numeric_id(row[7]) is not None
+    }
+
+    for record in override_records:
+        song_id = record["id"]
+        difficulty = record["difficulty"]
+
+        if song_id in constants_ids:
+            continue
+
+        key = (song_id, difficulty)
+
+        if key in existing_keys:
+            continue
+
+        appended_rows.append([
+            record["title"],
+            "",
+            "",
+            "",
+            difficulty.upper(),
+            "",
+            "",
+            str(song_id),
+            "",
+            record["constant"],
+        ])
+
+        existing_keys.add(key)
+
+    # Keep override-only entries at the bottom.
+    appended_rows = sort_rows(appended_rows)
+
+    final_rows = output_rows + appended_rows
+
+    print(f"Scraped rows: {len(output_rows)}.")
+    print(f"Override-only rows appended: {len(appended_rows)}.")
+    print(f"Unmatched community titles: {len(unmatched_titles)}.")
+
+    if unmatched_titles:
+        print(
+            "First unmatched titles: "
+            + ", ".join(sorted(unmatched_titles)[:20])
+        )
+
+    # 8. Write the output worksheet.
     try:
         worksheet = workbook.worksheet(OUTPUT_TAB)
     except gspread.WorksheetNotFound:
         worksheet = workbook.add_worksheet(
             title=OUTPUT_TAB,
-            rows=max(1000, len(rows) + 1),
+            rows=max(1000, len(final_rows) + 10),
             cols=len(HEADERS),
         )
 
     worksheet.clear()
 
+    worksheet.resize(
+        rows=max(1000, len(final_rows) + 10),
+        cols=len(HEADERS),
+    )
+
     worksheet.update(
         range_name="A1",
-        values=[HEADERS] + rows,
+        values=[HEADERS] + final_rows,
         value_input_option="RAW",
     )
 
-    print(
-        f"Updated {len(rows)} rows in '{OUTPUT_TAB}'."
+    matched_ids = sum(
+        1 for row in final_rows
+        if row[7]
     )
+
+    matched_39s = sum(
+        1 for row in final_rows
+        if row[8]
+    )
+
+    matched_overrides = sum(
+        1 for row in final_rows
+        if row[9]
+    )
+
+    print("=== COMMUNITY scraper completed ===")
+    print(f"Total output rows: {len(final_rows)}.")
+    print(f"IDs matched: {matched_ids}.")
+    print(f"39s constants matched: {matched_39s}.")
+    print(f"Overrides matched: {matched_overrides}.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        raise
