@@ -93,6 +93,7 @@ def render_chart(chart_url, title, jacket_url, difficulty):
 
 def job(p):
     hook = f"https://discord.com/api/v10/webhooks/{APP_ID}/{p['token']}/messages/@original"
+
     try:
         with render_lock:
             png = render_chart(
@@ -102,26 +103,27 @@ def job(p):
                 p.get("difficulty") or "MASTER"
             )
 
+        raw_color = p.get("embed_color")
+        try:
+            color = int(raw_color, 0) if isinstance(raw_color, str) else int(raw_color)
+        except (TypeError, ValueError):
+            color = 0x808080
+
         embed = {
-    "title": p.get("embed_title") or p["title"],
-    "color": p.get("embed_color", 0x808080),
-    "image": {"url": "attachment://chart.png"}
-}
+            "title": (p.get("embed_title") or p["title"]).replace("**", ""),
+            "color": color,
+            "image": {"url": "attachment://chart.png"}
+        }
 
-embeds = [embed]
+        charter = p.get("charter") or p.get("embed_footer")
 
-charter = p.get("charter") or p.get("embed_footer")
+        if charter:
+            embed["footer"] = {"text": str(charter)}
 
-if charter:
-    embeds.append({
-        "color": p.get("embed_color", 0x808080),
-        "description": f"-# {charter}"
-    })
-
-payload = {
-    "embeds": embeds,
-    "attachments": [{"id": 0, "filename": "chart.png"}]
-}
+        payload = {
+            "embeds": [embed],
+            "attachments": [{"id": 0, "filename": "chart.png"}]
+        }
 
         r = requests.patch(
             hook,
@@ -134,7 +136,7 @@ payload = {
     except Exception as e:
         requests.patch(
             hook,
-            json={"content": f"Render failed: {e}"[:1900]},
+            json={"content": f"Render failed: {str(e)}"[:1900], "embeds": []},
             timeout=30
         )
 
