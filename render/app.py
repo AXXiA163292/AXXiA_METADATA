@@ -103,20 +103,25 @@ def job(p):
             )
 
         embed = {
-            "title": p.get("embed_title") or p["title"],
-            "color": p.get("embed_color", 0x808080),
-            "image": {"url": "attachment://chart.png"}
-        }
+    "title": p.get("embed_title") or p["title"],
+    "color": p.get("embed_color", 0x808080),
+    "image": {"url": "attachment://chart.png"}
+}
 
-        if p.get("embed_footer") or p.get("charter"):
-            embed["footer"] = {
-                "text": p.get("embed_footer") or p.get("charter")
-            }
+embeds = [embed]
 
-        payload = {
-            "embeds": [embed],
-            "attachments": [{"id": 0, "filename": "chart.png"}]
-        }
+charter = p.get("charter") or p.get("embed_footer")
+
+if charter:
+    embeds.append({
+        "color": p.get("embed_color", 0x808080),
+        "description": f"-# {charter}"
+    })
+
+payload = {
+    "embeds": embeds,
+    "attachments": [{"id": 0, "filename": "chart.png"}]
+}
 
         r = requests.patch(
             hook,
