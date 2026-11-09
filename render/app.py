@@ -109,14 +109,21 @@ def job(p):
         requests.patch(hook, json={"content": f"Render failed: {e}"[:1900]}, timeout=30)
 
 
-@app.post("/render")
-def render():
+def handle_render():
     if request.headers.get("authorization") != f"Bearer {SECRET}":
         return jsonify(error="unauthorized"), 401
     threading.Thread(target=job, args=(request.get_json(),), daemon=True).start()
     return jsonify(ok=True), 202
 
 
-@app.get("/")
-def health():
+@app.route("/render", methods=["POST"])
+def render():
+    return handle_render()
+
+
+# also accept POST on "/" so a RENDER_URL without "/render" still works
+@app.route("/", methods=["GET", "POST"])
+def root():
+    if request.method == "POST":
+        return handle_render()
     return jsonify(ok=True)
