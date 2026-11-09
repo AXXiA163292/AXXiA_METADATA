@@ -340,7 +340,9 @@ def extract_lyrics(soup):
             continue
         if element.name and re.match(r'h[12]', element.name):
             break
-        if 'poem' not in (element.attrs.get('class') or []):
+        attrs = getattr(element, 'attrs', None) or {}
+        classes = attrs.get('class') or []
+        if 'poem' not in classes:
             continue
         for span in element.find_all('span', class_=re.compile(r'copy')):
             span.decompose()
