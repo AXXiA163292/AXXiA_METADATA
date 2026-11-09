@@ -1,0 +1,5 @@
+flask
+gunicorn
+requests
+rg-converters>=3.0
+git+https://github.com/Sbotga/pjsekai-scores
