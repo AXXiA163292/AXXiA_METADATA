@@ -1,4 +1,3 @@
-
 import os
 import re
 import csv
@@ -50,7 +49,6 @@ HEADERS = [
     "39sConstant",
     "Not39s",
 ]
-
 
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
@@ -161,7 +159,6 @@ def load_metadata(workbook):
 
     header = values[0]
 
-    # Only use title_jp and id.
     title_col = get_header_index(header, "title_jp")
     id_col = get_header_index(header, "id")
 
@@ -188,7 +185,12 @@ def load_metadata(workbook):
     return title_to_id, id_to_title
 
 
-def load_constants_table(client, spreadsheet_id, worksheet_name):
+def load_constants_table(
+    client,
+    spreadsheet_id,
+    worksheet_name,
+    override_title_fallback=False,
+):
     spreadsheet = client.open_by_key(spreadsheet_id)
     worksheet = spreadsheet.worksheet(worksheet_name)
     values = worksheet.get_all_values()
@@ -208,7 +210,6 @@ def load_constants_table(client, spreadsheet_id, worksheet_name):
     difficulty_col = get_header_index(header, "Difficulty")
     id_col = get_header_index(header, "Song ID")
 
-    # Title is optional and is never used for 39s matching.
     try:
         title_col = get_header_index(
             header,
@@ -229,11 +230,18 @@ def load_constants_table(client, spreadsheet_id, worksheet_name):
         if len(row) <= required:
             continue
 
-        title = (
-            str(row[title_col]).strip()
-            if title_col is not None and len(row) > title_col
-            else ""
-        )
+        if override_title_fallback:
+            title = (
+                str(row[1]).strip()
+                if len(row) > 1 and str(row[1]).strip()
+                else str(row[0]).strip() if row else ""
+            )
+        else:
+            title = (
+                str(row[title_col]).strip()
+                if title_col is not None and len(row) > title_col
+                else ""
+            )
 
         constant = str(row[constant_col]).strip()
         difficulty = normalize_difficulty(row[difficulty_col])
@@ -269,7 +277,6 @@ def build_constant_lookups(records, metadata_id_to_title):
 
         ids.add(song_id)
 
-        # Resolve the Japanese title exclusively through METADATA_RAW.
         jp_title = metadata_id_to_title.get(song_id)
 
         if not jp_title:
@@ -513,7 +520,6 @@ def sort_rows(rows):
 def main():
     print("=== COMMUNITY scraper started ===")
 
-    # 1. Scrape the four community pages.
     scraped_rows = []
 
     for index, difficulty in enumerate(
@@ -535,11 +541,9 @@ def main():
             "No community rows found. Google Sheets was not modified."
         )
 
-    # 2. Connect to Google Sheets.
     client = get_client()
     workbook = client.open_by_key(SPREADSHEET_ID)
 
-    # 3. Load metadata and constants.
     metadata_title_to_id, metadata_id_to_title = load_metadata(
         workbook
     )
@@ -554,16 +558,14 @@ def main():
         client,
         CONSTANTS_COMMUNITY_ID,
         CONSTANTS_COMMUNITY_TAB,
+        override_title_fallback=True,
     )
 
-    # 4. Build lookup tables.
-    # 39s matching uses Song ID -> METADATA_RAW title_jp.
     constants_by_title, constants_ids = build_constant_lookups(
         constants_39s_records,
         metadata_id_to_title,
     )
 
-    # Overrides continue to use metadata ID + difficulty.
     override_lookup = build_override_lookup(
         override_records
     )
@@ -583,7 +585,6 @@ def main():
         f"{len(override_records)}."
     )
 
-    # 5. Match scraped rows using title_jp.
     output_rows = []
     represented_override_keys = set()
     unmatched_titles = set()
@@ -593,13 +594,11 @@ def main():
         title_key = normalize_title(title)
         difficulty = normalize_difficulty(item[4])
 
-        # Forum title is matched directly against METADATA_RAW title_jp.
         song_id = metadata_title_to_id.get(title_key)
 
         if song_id is None:
             unmatched_titles.add(title)
 
-        # 39s constant is matched through metadata ID -> title_jp.
         constant_39s = constants_by_title.get(
             (title_key, difficulty),
             "",
@@ -623,10 +622,8 @@ def main():
             ]
         )
 
-    # 6. Sort scraped rows.
     output_rows = sort_rows(output_rows)
 
-    # 7. Add override-only entries that are not in 39s Constants.
     appended_rows = []
 
     existing_keys = {
@@ -650,9 +647,9 @@ def main():
         if key in existing_keys:
             continue
 
-        jp_title = metadata_id_to_title.get(
-            song_id,
-            record["title"],
+        jp_title = (
+            metadata_id_to_title.get(song_id)
+            or record["title"]
         )
 
         appended_rows.append([
@@ -684,7 +681,6 @@ def main():
             + ", ".join(sorted(unmatched_titles)[:20])
         )
 
-    # 8. Write the output worksheet.
     try:
         worksheet = workbook.worksheet(OUTPUT_TAB)
     except gspread.WorksheetNotFound:
