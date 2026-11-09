@@ -96,17 +96,42 @@ def job(p):
     try:
         with render_lock:
             png = render_chart(
-                p["chart_url"], p["title"], p.get("jacket_url"), p.get("difficulty", "MASTER")
+                p["chart_url"],
+                p["title"],
+                p.get("jacket_url"),
+                p.get("difficulty") or "MASTER"
             )
+
+        embed = {
+            "title": p.get("embed_title") or p["title"],
+            "color": p.get("embed_color", 0x808080),
+            "image": {"url": "attachment://chart.png"}
+        }
+
+        if p.get("embed_footer") or p.get("charter"):
+            embed["footer"] = {
+                "text": p.get("embed_footer") or p.get("charter")
+            }
+
+        payload = {
+            "embeds": [embed],
+            "attachments": [{"id": 0, "filename": "chart.png"}]
+        }
+
         r = requests.patch(
             hook,
-            data={"payload_json": json.dumps({"content": f"**{p['title']}** • {p.get('difficulty', 'MASTER')}"})},
+            data={"payload_json": json.dumps(payload)},
             files={"files[0]": ("chart.png", png, "image/png")},
             timeout=90,
         )
         r.raise_for_status()
+
     except Exception as e:
-        requests.patch(hook, json={"content": f"Render failed: {e}"[:1900]}, timeout=30)
+        requests.patch(
+            hook,
+            json={"content": f"Render failed: {e}"[:1900]},
+            timeout=30
+        )
 
 
 def handle_render():
