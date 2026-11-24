@@ -182,54 +182,77 @@ def find_song_html(title):
     return None
 
 
+
 def extract_audio_and_versions(soup):
     audio_entries = []
-    audio_heading = soup.find(id='Audio')
-    if audio_heading:
-        parent = audio_heading.find_parent()
-        table = parent.find_next('table') if parent else None
-        if table:
-            for tr in table.find_all('tr'):
-                cells = tr.find_all('td')
-                if len(cells) < 2:
-                    continue
-                source = tr.find('source') or tr.find('audio')
-                if not source:
-                    continue
-                audio_url = source.get('src', '-')
-                if 'static.wikia.nocookie.net' not in audio_url or '.ogg' not in audio_url:
-                    continue
-                raw_version = clean(cells[1])
-                duration = '-'
-                if len(cells) > 2:
-                    candidate_duration = clean(cells[2])
-                    if re.fullmatch(r'\d+:\d{2}', candidate_duration):
-                        duration = candidate_duration
-                if raw_version.count('(') > raw_version.count(')'):
-                    raw_version += ')' * (raw_version.count('(') - raw_version.count(')'))
-                version = raw_version
-                for inner in reversed(re.findall(r'\(([^)]*)\)', raw_version)):
-                    if (
-                        'Version' in inner or 'Instrumental' in inner
-                        or inner.startswith('Full/Game')
-                        or re.match(r'^Game\s*[-–]', inner)
-                        or re.match(r'^Game\s+Version', inner)
-                    ):
-                        version = inner
-                        break
-                if version.count('(') > version.count(')'):
-                    version += ')' * (version.count('(') - version.count(')'))
-                version = re.sub(r'Full/Game Size', 'Full/Game Version', version, flags=re.I)
-                version = re.sub(r'^Game(?!\s+Version)(\s+-)', r'Game Version\1', version)
-                parts = version.split(' - ')
-                version_type = parts[0].strip().replace('(', '').replace(')', '').strip()
-                artist = ' - '.join(parts[1:]).strip().replace('(', '').replace(')', '').strip() if len(parts) > 1 else ''
-                audio_entries.append({
-                    'versionType': version_type,
-                    'artist': fix_artist(artist),
-                    'url': audio_url,
-                    'duration': duration,
-                })
+
+    for audio in soup.find_all('audio'):
+        tr = audio.find_parent('tr')
+        if not tr:
+            continue
+
+        cells = tr.find_all('td')
+        if len(cells) < 2:
+            continue
+
+        source = audio.find('source')
+        audio_url = (
+            audio.get('src')
+            or audio.get('data-src')
+            or (source.get('src') if source else None)
+            or (source.get('data-src') if source else None)
+            or ''
+        ).strip()
+
+        if (
+            not audio_url
+            or '.ogg' not in audio_url.lower()
+            or not any(host in audio_url for host in (
+                'static.wikia.nocookie.net',
+                'static.wikia.com',
+            ))
+        ):
+            continue
+
+        raw_version = clean(cells[1])
+        duration = '-'
+
+        if len(cells) > 2:
+            candidate_duration = clean(cells[2])
+            if re.fullmatch(r'\d+:\d{2}', candidate_duration):
+                duration = candidate_duration
+
+        if raw_version.count('(') > raw_version.count(')'):
+            raw_version += ')' * (raw_version.count('(') - raw_version.count(')'))
+
+        version = raw_version
+
+        for inner in reversed(re.findall(r'\(([^)]*)\)', raw_version)):
+            if (
+                'Version' in inner or 'Instrumental' in inner
+                or inner.startswith('Full/Game')
+                or re.match(r'^Game\s*[-–]', inner)
+                or re.match(r'^Game\s+Version', inner)
+            ):
+                version = inner
+                break
+
+        if version.count('(') > version.count(')'):
+            version += ')' * (version.count('(') - version.count(')'))
+
+        version = re.sub(r'Full/Game Size', 'Full/Game Version', version, flags=re.I)
+        version = re.sub(r'^Game(?!\s+Version)(\s+-)', r'Game Version\1', version)
+
+        parts = version.split(' - ')
+        version_type = parts[0].strip().replace('(', '').replace(')', '').strip()
+        artist = ' - '.join(parts[1:]).strip().replace('(', '').replace(')', '').strip() if len(parts) > 1 else ''
+
+        audio_entries.append({
+            'versionType': version_type,
+            'artist': fix_artist(artist),
+            'url': audio_url,
+            'duration': duration,
+        })
 
     non_instrumental_indices = [
         index for index, entry in enumerate(audio_entries)
